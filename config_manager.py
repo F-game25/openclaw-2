@@ -131,7 +131,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         flat_config['security'].jwt_secret_key = jwt_secret
     
     # Validate that JWT secret was changed from default
-    if flat_config['security'].jwt_secret_key == "CHANGE_THIS_IN_CONFIG_LOCAL_YML":
+    if flat_config['security'].jwt_secret_key == "CHANGE_THIS_IN_CONFIG_LOCAL_YML_OR_SET_JWT_SECRET_KEY_ENV_VAR":
         if not jwt_secret:
             raise ValueError(
                 "Security Error: JWT secret key must be changed from default. "

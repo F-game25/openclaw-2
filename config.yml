@@ -17,7 +17,7 @@ server:
 # Security Settings
 security:
   # JWT Settings
-  jwt_secret_key: "CHANGE_THIS_IN_CONFIG_LOCAL_YML"  # Override in config.local.yml
+  jwt_secret_key: "CHANGE_THIS_IN_CONFIG_LOCAL_YML_OR_SET_JWT_SECRET_KEY_ENV_VAR"  # Override in config.local.yml
   jwt_algorithm: "HS256"
   access_token_expire_minutes: 30
   

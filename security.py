@@ -9,14 +9,11 @@ from datetime import datetime, timedelta
 from typing import Optional, Union
 from pathlib import Path
 
-from passlib.context import CryptContext
+import bcrypt
 from jose import JWTError, jwt
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class PasswordValidator:
@@ -149,11 +146,11 @@ class AuthManager:
     
     def hash_password(self, password: str) -> str:
         """Hash password using bcrypt"""
-        return pwd_context.hash(password)
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
         """Verify password against hash"""
-        return pwd_context.verify(plain_password, hashed_password)
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
     
     def create_access_token(self, data: dict,
                            expires_delta: Optional[timedelta] = None) -> str:
@@ -210,14 +207,15 @@ class EncryptionManager:
             self.key = Fernet.generate_key()
         else:
             # Derive key from password
-            kdf = PBKDF2(
+            kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=b'openclaw_secure_salt_v2',  # In production, use random salt
                 iterations=100000,
             )
             key = kdf.derive(password.encode())
-            self.key = Fernet(key)
+            import base64
+            self.key = base64.urlsafe_b64encode(key)
         
         self.cipher = Fernet(self.key)
     
