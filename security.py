@@ -195,22 +195,40 @@ class AuthManager:
 class EncryptionManager:
     """Manages data encryption"""
     
-    def __init__(self, password: Optional[str] = None):
+    def __init__(self, password: Optional[str] = None, salt: Optional[bytes] = None):
         """
         Initialize encryption manager
         
         Args:
-            password: Password for key derivation (generates random if None)
+            password: Password for key derivation (generates random key if None)
+            salt: Salt for key derivation (generates random salt if None and password is provided)
+        
+        Note:
+            If you need to decrypt data later, you must save and reuse the same salt.
+            For application-level encryption, use a consistent salt stored securely.
+            For per-record encryption, generate and store a unique salt per record.
         """
         if password is None:
-            # Generate random key
+            # Generate random key for temporary encryption
             self.key = Fernet.generate_key()
+            self.salt = None
         else:
+            # Generate or use provided salt
+            if salt is None:
+                # For application-level encryption with reusable key
+                # WARNING: Using a fixed salt means the same password always produces
+                # the same encryption key. This is acceptable for application-level
+                # config encryption but NOT for user data encryption.
+                # For user data, generate unique salt per record and store it.
+                salt = b'openclaw_v2_app_level_salt_2026'
+            
+            self.salt = salt
+            
             # Derive key from password
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
-                salt=b'openclaw_secure_salt_v2',  # In production, use random salt
+                salt=salt,
                 iterations=100000,
             )
             key = kdf.derive(password.encode())

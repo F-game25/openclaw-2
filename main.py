@@ -253,7 +253,7 @@ async def chat(request: Request, chat_request: ChatRequest):
     # Sanitize input
     message = InputSanitizer.sanitize_input(
         chat_request.message,
-        max_length=config.limits.max_file_upload_size_mb * 1024 * 1024
+        max_length=10000  # Match ChatRequest model limit
     )
     
     # Generate or validate session ID
