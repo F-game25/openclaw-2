@@ -5,9 +5,9 @@ Handles secure loading and validation of configuration
 import os
 import yaml
 from pathlib import Path
-from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field, validator
-from pydantic_settings import BaseSettings
+from typing import Optional
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class SecurityConfig(BaseModel):
@@ -77,25 +77,23 @@ class Config(BaseSettings):
     debug: bool = False
     host: str = "127.0.0.1"
     port: int = 8000
-    
+
     security: SecurityConfig
     privacy: PrivacyConfig
     ai: AIConfig
     logging: LoggingConfig
     limits: LimitsConfig
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 def load_config(config_path: Optional[str] = None) -> Config:
     """
     Load configuration from YAML file with secure defaults
-    
+
     Args:
         config_path: Path to config file (defaults to config.yml)
-        
+
     Returns:
         Config object with validated settings
     """
@@ -105,11 +103,11 @@ def load_config(config_path: Optional[str] = None) -> Config:
             config_path = "config.local.yml"
         else:
             config_path = "config.yml"
-    
+
     # Load YAML config
     with open(config_path, 'r') as f:
         yaml_config = yaml.safe_load(f)
-    
+
     # Flatten nested structure for pydantic
     flat_config = {
         'app_name': yaml_config.get('app', {}).get('name', 'OpenClaw AI'),
@@ -124,12 +122,12 @@ def load_config(config_path: Optional[str] = None) -> Config:
         'logging': LoggingConfig(**yaml_config.get('logging', {})),
         'limits': LimitsConfig(**yaml_config.get('limits', {})),
     }
-    
+
     # Override JWT secret from environment if available
     jwt_secret = os.getenv('JWT_SECRET_KEY')
     if jwt_secret:
         flat_config['security'].jwt_secret_key = jwt_secret
-    
+
     # Validate that JWT secret was changed from default
     if flat_config['security'].jwt_secret_key == "CHANGE_THIS_IN_CONFIG_LOCAL_YML_OR_SET_JWT_SECRET_KEY_ENV_VAR":
         if not jwt_secret:
@@ -137,48 +135,48 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 "Security Error: JWT secret key must be changed from default. "
                 "Set JWT_SECRET_KEY environment variable or update config.local.yml"
             )
-    
+
     return Config(**flat_config)
 
 
 def validate_security_config(config: Config) -> list[str]:
     """
     Validate security configuration and return warnings
-    
+
     Args:
         config: Configuration to validate
-        
+
     Returns:
         List of security warnings
     """
     warnings = []
-    
+
     # Check if binding to public interface
     if config.host != "127.0.0.1" and config.host != "localhost":
         warnings.append(
             f"WARNING: Server is configured to bind to {config.host}. "
             "For maximum security, use 127.0.0.1 (localhost only)."
         )
-    
+
     # Check if debug mode is enabled
     if config.debug and config.environment == "production":
         warnings.append(
             "WARNING: Debug mode is enabled in production. "
             "This may expose sensitive information."
         )
-    
+
     # Check external API calls
     if not config.privacy.external_api_calls_disabled:
         warnings.append(
             "INFO: External API calls are enabled. "
             "Set privacy.external_api_calls_disabled=true for maximum privacy."
         )
-    
+
     # Check encryption
     if not config.privacy.encrypt_data_at_rest:
         warnings.append(
             "WARNING: Data encryption at rest is disabled. "
             "Enable privacy.encrypt_data_at_rest for better security."
         )
-    
+
     return warnings
