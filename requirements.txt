@@ -1,0 +1,26 @@
+# Core dependencies
+fastapi==0.115.5
+uvicorn==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+# Security
+cryptography==46.0.5
+python-jose[cryptography]==3.4.0
+bcrypt==5.0.0
+python-multipart==0.0.22
+
+# Rate limiting
+slowapi==0.1.9
+
+# Database (SQLite for local storage)
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+
+# Utilities
+pyyaml==6.0.2
+
+# Testing
+pytest==8.3.4
+httpx==0.28.1

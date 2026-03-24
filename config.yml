@@ -1,0 +1,95 @@
+# OpenClaw AI - Secure Configuration Template
+# Copy to config.local.yml and customize for your environment
+
+# Application Settings
+app:
+  name: "OpenClaw AI - Private & Secure"
+  version: "2.0.0"
+  environment: "production"
+  debug: false
+  
+# Server Configuration
+server:
+  host: "127.0.0.1"  # Only bind to localhost for security
+  port: 8000
+  workers: 1
+  
+# Security Settings
+security:
+  # JWT Settings
+  jwt_secret_key: "CHANGE_THIS_IN_CONFIG_LOCAL_YML_OR_SET_JWT_SECRET_KEY_ENV_VAR"  # Override in config.local.yml
+  jwt_algorithm: "HS256"
+  access_token_expire_minutes: 30
+  
+  # Password Requirements
+  min_password_length: 12
+  require_special_chars: true
+  require_numbers: true
+  require_uppercase: true
+  
+  # Rate Limiting
+  rate_limit_enabled: true
+  rate_limit_per_minute: 60
+  
+  # CORS - Restrict to localhost only
+  cors_origins:
+    - "http://localhost:8000"
+    - "http://127.0.0.1:8000"
+  
+  # Session Settings
+  max_sessions_per_user: 3
+  session_timeout_minutes: 60
+
+# Privacy Settings
+privacy:
+  # Data Storage
+  data_dir: "./data"
+  logs_dir: "./logs"
+  
+  # Privacy Features
+  telemetry_enabled: false
+  analytics_enabled: false
+  external_api_calls_disabled: false  # Set to true to block all external calls
+  
+  # Data Retention
+  log_retention_days: 30
+  session_data_retention_days: 7
+  
+  # Encryption
+  encrypt_data_at_rest: true
+  encryption_algorithm: "AES-256-GCM"
+
+# AI Model Settings
+ai:
+  # Local model settings
+  use_local_model: true
+  model_path: "./models"
+  
+  # API settings (if using external APIs)
+  # These should be set via environment variables for security
+  openai_api_key_env: "OPENAI_API_KEY"
+  anthropic_api_key_env: "ANTHROPIC_API_KEY"
+  
+  # Model constraints
+  max_tokens: 2048
+  temperature: 0.7
+  
+# Logging
+logging:
+  level: "INFO"
+  format: "json"
+  file_enabled: true
+  console_enabled: true
+  
+  # Security audit logging
+  audit_enabled: true
+  audit_failed_auth: true
+  audit_file_access: true
+  audit_api_calls: true
+
+# Resource Limits
+limits:
+  max_file_upload_size_mb: 10
+  max_concurrent_requests: 10
+  max_memory_usage_mb: 1024
+  request_timeout_seconds: 30
