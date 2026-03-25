@@ -273,25 +273,50 @@ def process_requests() -> int:
         return 0
 
     completed = 0
+    # Track requests we modify so we can safely merge into a fresh snapshot
+    updated_by_id = {}
+
     for req in pending:
         req_id = req.get("id", "unknown")
         query = req.get("query", "").strip()
         if not query:
             req["status"] = "error"
             req["error"] = "Empty query"
+            if req_id != "unknown":
+                updated_by_id[req_id] = req
             continue
 
         print(f"[{now_iso()}] web-researcher: bot request '{req_id}': '{query[:60]}'")
-        result = do_research(query, context=req.get("context", ""), include_news=req.get("include_news", False))
+        result = do_research(
+            query,
+            context=req.get("context", ""),
+            include_news=req.get("include_news", False),
+        )
         req["status"] = "done"
         req["result"] = result
         req["completed_at"] = now_iso()
-        append_result({**result, "requester": req.get("requester", "bot"), "id": req_id})
+        append_result(
+            {**result, "requester": req.get("requester", "bot"), "id": req_id}
+        )
+        if req_id != "unknown":
+            updated_by_id[req_id] = req
         completed += 1
         print(f"[{now_iso()}] web-researcher: request '{req_id}' complete")
 
     if completed:
-        save_requests(requests)
+        # Reload latest state to avoid clobbering concurrent writers and merge
+        current_requests = load_requests()
+        if updated_by_id:
+            merged = []
+            for existing in current_requests:
+                existing_id = existing.get("id", "unknown")
+                # Replace only the requests we actually updated
+                if existing_id != "unknown" and existing_id in updated_by_id:
+                    merged.append(updated_by_id[existing_id])
+                else:
+                    merged.append(existing)
+            current_requests = merged
+        save_requests(current_requests)
     return completed
 
 
