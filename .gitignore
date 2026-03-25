@@ -53,3 +53,13 @@ logs/
 *.crt
 *.p12
 api_keys.txt
+
+# AI Employee runtime state (generated at runtime)
+run/
+state/
+workspace/
+
+# OpenClaw 2
+openclaw2/data/
+openclaw2/logs/
+openclaw2/config.local.yml
