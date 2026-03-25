@@ -162,19 +162,22 @@ def cmd_outreach(campaign_name: str) -> str:
     )
     sequence = _ai(prompt, system="You are a top B2B sales copywriter specialising in cold outreach.")
 
-    # Save campaign to pipeline prospects in 'prospect' stage
+    # Save campaign to at most DAILY_OUTREACH_LIMIT pipeline prospects in 'prospect' stage
+    contacted_this_run = 0
     for p in pipeline:
         if p["stage"] == "prospect":
+            if contacted_this_run >= DAILY_OUTREACH_LIMIT:
+                break
             p["outreach_sequence"] = [{"campaign": campaign_name, "sequence": sequence, "sent_at": None}]
             p["stage"] = "contacted"
             p["updated_at"] = now_iso()
+            contacted_this_run += 1
 
     save_pipeline(pipeline)
 
-    daily = min(len([p for p in pipeline if p["stage"] == "contacted"]), DAILY_OUTREACH_LIMIT)
     return (
         f"[{now_iso()}] Campaign '{campaign_name}' generated. "
-        f"Marked {daily} prospects as 'contacted'.\n\n{sequence}"
+        f"Marked {contacted_this_run} prospects as 'contacted'.\n\n{sequence}"
     )
 
 def cmd_pipeline() -> str:
