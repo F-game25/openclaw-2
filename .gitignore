@@ -53,3 +53,9 @@ logs/
 *.crt
 *.p12
 api_keys.txt
+
+# AI Employee runtime state (generated at runtime)
+ai-employee/logs/
+ai-employee/run/
+ai-employee/state/
+ai-employee/workspace/

@@ -1,0 +1,16 @@
+.env
+.ai-employee/
+.openclaw/
+*.log
+logs/
+.DS_Store
+node_modules/
+tmp/
+temp/
+*.tmp
+*~
+*.swp
+*.bak
+__pycache__/
+*.pyc
+*.pyo

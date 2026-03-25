@@ -1,10 +1,13 @@
 #!/bin/bash
-# Setup script for OpenClaw AI - Private & Secure
+# Setup script for OpenClaw AI + AI Employee (merged)
 
 set -e
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AI_EMPLOYEE_DIR="$REPO_DIR/ai-employee"
+
 echo "================================================"
-echo "OpenClaw AI - Private & Secure Edition"
+echo "OpenClaw AI + AI Employee"
 echo "Setup Script"
 echo "================================================"
 echo ""
@@ -23,13 +26,13 @@ fi
 # Create virtual environment
 echo ""
 echo "Creating virtual environment..."
-python3 -m venv venv
+python3 -m venv "$REPO_DIR/venv"
 echo "✓ Virtual environment created"
 
 # Activate virtual environment
 echo ""
 echo "Activating virtual environment..."
-source venv/bin/activate
+source "$REPO_DIR/venv/bin/activate"
 echo "✓ Virtual environment activated"
 
 # Upgrade pip
@@ -38,23 +41,24 @@ echo "Upgrading pip..."
 pip install --upgrade pip > /dev/null
 echo "✓ pip upgraded"
 
-# Install dependencies
+# Install all dependencies (OpenClaw + AI Employee)
 echo ""
 echo "Installing dependencies..."
-pip install -r requirements.txt
+pip install -r "$REPO_DIR/requirements.txt"
 echo "✓ Dependencies installed"
 
 # Create necessary directories
 echo ""
 echo "Creating directories..."
-mkdir -p data logs
+mkdir -p "$REPO_DIR/data" "$REPO_DIR/logs"
+mkdir -p "$AI_EMPLOYEE_DIR/logs" "$AI_EMPLOYEE_DIR/run" "$AI_EMPLOYEE_DIR/state" "$AI_EMPLOYEE_DIR/workspace"
 echo "✓ Directories created"
 
 # Setup configuration
 echo ""
-if [ ! -f "config.local.yml" ]; then
+if [ ! -f "$REPO_DIR/config.local.yml" ]; then
     echo "Creating local configuration..."
-    cp config.yml config.local.yml
+    cp "$REPO_DIR/config.yml" "$REPO_DIR/config.local.yml"
     echo "✓ config.local.yml created"
     echo ""
     echo "⚠️  IMPORTANT: Edit config.local.yml and change the JWT secret key!"
@@ -64,9 +68,9 @@ fi
 
 # Setup environment file
 echo ""
-if [ ! -f ".env" ]; then
+if [ ! -f "$REPO_DIR/.env" ]; then
     echo "Creating .env file..."
-    cp .env.example .env
+    cp "$REPO_DIR/.env.example" "$REPO_DIR/.env"
     echo "✓ .env created"
     echo ""
     echo "⚠️  IMPORTANT: Edit .env and add your JWT secret key!"
@@ -90,10 +94,19 @@ echo ""
 
 # Set secure permissions
 echo "Setting secure file permissions..."
-chmod 700 data logs
-chmod 600 .env 2>/dev/null || true
-chmod 600 config.local.yml 2>/dev/null || true
+chmod 700 "$REPO_DIR/data" "$REPO_DIR/logs"
+chmod 600 "$REPO_DIR/.env" 2>/dev/null || true
+chmod 600 "$REPO_DIR/config.local.yml" 2>/dev/null || true
 echo "✓ Permissions set"
+
+# Set AI Employee shell scripts executable
+echo ""
+echo "Setting AI Employee script permissions..."
+chmod +x "$AI_EMPLOYEE_DIR/runtime/bin/ai-employee" 2>/dev/null || true
+chmod +x "$AI_EMPLOYEE_DIR/runtime/start.sh" 2>/dev/null || true
+chmod +x "$AI_EMPLOYEE_DIR/runtime/stop.sh" 2>/dev/null || true
+find "$AI_EMPLOYEE_DIR/runtime/bots" -name "run.sh" -exec chmod +x {} \; 2>/dev/null || true
+echo "✓ AI Employee scripts are executable"
 
 echo ""
 echo "================================================"
@@ -102,8 +115,9 @@ echo "================================================"
 echo ""
 echo "Next steps:"
 echo "1. Edit .env and add the JWT secret above"
+echo "   Also add: ANTHROPIC_API_KEY (optional, for Claude agent)"
 echo "2. Review config.local.yml and adjust settings"
-echo "3. Run: python main.py"
+echo "3. Run: ./start.sh"
 echo ""
 echo "For security best practices, see SECURITY.md"
 echo ""

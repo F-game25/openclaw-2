@@ -1,0 +1,3028 @@
+"""AI Employee Dashboard — Problem Solver UI
+
+Extended dashboard with 5 tabs:
+  1. Dashboard  — bot status overview
+  2. Chat       — send tasks / view chat log (mirrors WhatsApp tasks)
+  3. Scheduler  — create/edit/list scheduled tasks
+  4. Workers    — view/adjust enabled bots
+  5. Improvements — approve/reject skill/market proposals
+
+State files are read from ~/.ai-employee/state/
+Config is read/written in ~/.ai-employee/config/
+"""
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+import uvicorn
+
+AI_HOME = Path(os.environ.get("AI_HOME", str(Path.home() / ".ai-employee")))
+STATE_DIR = AI_HOME / "state"
+CONFIG_DIR = AI_HOME / "config"
+BOTS_DIR = AI_HOME / "bots"
+CHATLOG = STATE_DIR / "chatlog.jsonl"
+SCHEDULES_FILE = CONFIG_DIR / "schedules.json"
+IMPROVEMENTS_FILE = STATE_DIR / "improvements.json"
+SKILLS_LIBRARY_FILE = CONFIG_DIR / "skills_library.json"
+CUSTOM_AGENTS_FILE = CONFIG_DIR / "custom_agents.json"
+
+PORT = int(os.environ.get("PROBLEM_SOLVER_UI_PORT", "8787"))
+HOST = os.environ.get("PROBLEM_SOLVER_UI_HOST", "127.0.0.1")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("problem-solver-ui")
+
+# ── AI router (Ollama first, cloud fallback) ──────────────────────────────────
+
+_ai_router_path = AI_HOME / "bots" / "ai-router"
+if str(_ai_router_path) not in sys.path:
+    sys.path.insert(0, str(_ai_router_path))
+
+try:
+    from ai_router import query_ai as _query_ai  # type: ignore
+    _AI_ROUTER_AVAILABLE = True
+except ImportError:
+    _AI_ROUTER_AVAILABLE = False
+
+app = FastAPI(title="AI Employee Dashboard")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ai_employee(*args: str) -> tuple:
+    try:
+        p = subprocess.run(
+            [str(AI_HOME / "bin" / "ai-employee"), *args],
+            capture_output=True, text=True, timeout=10
+        )
+        return p.returncode, p.stdout + p.stderr
+    except Exception as e:
+        return 1, str(e)
+
+
+# ─── HTML Dashboard ────────────────────────────────────────────────────────────
+
+# ─── HTML Dashboard ────────────────────────────────────────────────────────────
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>AI Employee Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#080e1a;--surface:#0d1626;--surface2:#111d30;--border:#1e2d45;
+      --primary:#6366f1;--primary-dark:#4f46e5;--accent:#22d3ee;
+      --success:#10b981;--danger:#ef4444;--warning:#f59e0b;
+      --text:#e2e8f0;--text-muted:#64748b;--text-secondary:#94a3b8;
+      --radius:12px;--radius-sm:8px;--shadow:0 4px 24px rgba(0,0,0,.4);
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    html{scroll-behavior:smooth}
+    body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
+
+    /* ── Scrollbars ── */
+    ::-webkit-scrollbar{width:6px;height:6px}
+    ::-webkit-scrollbar-track{background:var(--surface)}
+    ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+    ::-webkit-scrollbar-thumb:hover{background:#2a3d5a}
+
+    /* ── Layout ── */
+    .app{display:flex;flex-direction:column;min-height:100vh}
+
+    /* ── Header ── */
+    header{
+      background:linear-gradient(135deg,var(--primary-dark) 0%,#312e81 50%,#1e1b4b 100%);
+      padding:16px 28px;display:flex;align-items:center;justify-content:space-between;
+      border-bottom:1px solid rgba(99,102,241,.25);
+      position:sticky;top:0;z-index:100;backdrop-filter:blur(10px);
+    }
+    .header-left{display:flex;align-items:center;gap:14px}
+    .logo{width:40px;height:40px;background:rgba(255,255,255,.1);border-radius:10px;
+      display:flex;align-items:center;justify-content:center;font-size:1.4em;
+      border:1px solid rgba(255,255,255,.15)}
+    .header-title h1{color:#fff;font-size:1.2em;font-weight:700;letter-spacing:-.02em}
+    .header-title .sub{color:rgba(255,255,255,.6);font-size:.8em;margin-top:1px}
+    .header-right{display:flex;align-items:center;gap:10px}
+    .status-pill{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.07);
+      border:1px solid rgba(255,255,255,.12);border-radius:20px;
+      padding:5px 12px;font-size:.8em;color:rgba(255,255,255,.75)}
+    .status-dot{width:7px;height:7px;border-radius:50%;background:var(--success);
+      box-shadow:0 0 6px var(--success);animation:blink 2s infinite}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+
+    /* ── Navigation ── */
+    nav{background:var(--surface);border-bottom:1px solid var(--border);
+      padding:0 28px;display:flex;gap:2px;overflow-x:auto}
+    nav button{
+      background:none;border:none;color:var(--text-secondary);
+      padding:12px 16px;cursor:pointer;font-size:.875em;font-weight:500;
+      border-bottom:2px solid transparent;transition:all .2s;
+      white-space:nowrap;display:flex;align-items:center;gap:6px;
+      font-family:inherit;
+    }
+    nav button:hover{color:var(--text);background:rgba(255,255,255,.03)}
+    nav button.active{color:var(--primary);border-bottom-color:var(--primary);background:rgba(99,102,241,.05)}
+
+    /* ── Main content ── */
+    main{flex:1;padding:24px 28px;max-width:1280px;margin:0 auto;width:100%}
+    @media(max-width:768px){main{padding:16px}}
+
+    /* ── Tab panels ── */
+    .tab-content{display:none}
+    .tab-content.active{display:block;animation:fadeIn .2s ease}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+    /* ── Cards ── */
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+    .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+    .card-title{font-size:.95em;font-weight:600;color:var(--text);display:flex;align-items:center;gap:8px}
+    .card-title .icon{color:var(--primary)}
+    .section-title{font-size:.8em;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px}
+
+    /* ── Grid layouts ── */
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+    .grid-stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+    @media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
+
+    /* ── Stat cards ── */
+    .stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);
+      padding:16px;display:flex;align-items:center;gap:12px}
+    .stat-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;
+      justify-content:center;font-size:1.1em;flex-shrink:0}
+    .stat-icon.green{background:rgba(16,185,129,.15);color:var(--success)}
+    .stat-icon.blue{background:rgba(99,102,241,.15);color:var(--primary)}
+    .stat-icon.cyan{background:rgba(34,211,238,.15);color:var(--accent)}
+    .stat-icon.yellow{background:rgba(245,158,11,.15);color:var(--warning)}
+    .stat-body .val{font-size:1.5em;font-weight:700;color:var(--text)}
+    .stat-body .lbl{font-size:.78em;color:var(--text-muted);margin-top:1px}
+
+    /* ── Bot rows ── */
+    .bot-row{display:flex;align-items:center;gap:10px;padding:9px 0;
+      border-bottom:1px solid var(--border)}
+    .bot-row:last-child{border:none}
+    .dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;transition:background .3s}
+    .dot.on{background:var(--success);box-shadow:0 0 8px rgba(16,185,129,.5)}
+    .dot.off{background:#374151}
+    .dot.unknown{background:var(--warning)}
+    .bot-name{flex:1;font-size:.88em;color:var(--text)}
+
+    /* ── Badges ── */
+    .badge{display:inline-flex;align-items:center;padding:2px 9px;border-radius:20px;
+      font-size:.75em;font-weight:600;letter-spacing:.01em}
+    .badge.running,.badge.approved{background:rgba(16,185,129,.12);color:var(--success);border:1px solid rgba(16,185,129,.25)}
+    .badge.stopped,.badge.rejected{background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.25)}
+    .badge.pending{background:rgba(245,158,11,.12);color:var(--warning);border:1px solid rgba(245,158,11,.25)}
+    .badge.enabled{background:rgba(99,102,241,.12);color:var(--primary);border:1px solid rgba(99,102,241,.25)}
+    .badge.disabled{background:rgba(100,116,139,.12);color:var(--text-muted);border:1px solid rgba(100,116,139,.25)}
+
+    /* ── Buttons ── */
+    .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border:none;
+      border-radius:var(--radius-sm);cursor:pointer;font-size:.875em;font-weight:500;
+      transition:all .2s;font-family:inherit;text-decoration:none;white-space:nowrap}
+    .btn-primary{background:var(--primary);color:#fff}
+    .btn-primary:hover{background:var(--primary-dark);transform:translateY(-1px);box-shadow:0 4px 12px rgba(99,102,241,.4)}
+    .btn-danger{background:rgba(239,68,68,.15);color:var(--danger);border:1px solid rgba(239,68,68,.25)}
+    .btn-danger:hover{background:rgba(239,68,68,.25)}
+    .btn-success{background:rgba(16,185,129,.15);color:var(--success);border:1px solid rgba(16,185,129,.25)}
+    .btn-success:hover{background:rgba(16,185,129,.25)}
+    .btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+    .btn-ghost:hover{background:rgba(255,255,255,.08);color:var(--text)}
+    .btn-sm{padding:5px 11px;font-size:.8em}
+    .btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+
+    /* ── Form controls ── */
+    .form-group{margin-bottom:14px}
+    label{display:block;font-size:.82em;font-weight:500;color:var(--text-secondary);margin-bottom:5px}
+    input,textarea,select{
+      width:100%;background:var(--surface2);border:1px solid var(--border);
+      color:var(--text);border-radius:var(--radius-sm);padding:9px 12px;
+      font-size:.875em;font-family:inherit;transition:border-color .2s;outline:none}
+    input:focus,textarea:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+    textarea{resize:vertical;min-height:80px}
+    select option{background:var(--surface)}
+
+    /* ── Code / pre ── */
+    pre{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);
+      padding:14px;overflow:auto;font-size:.82em;max-height:280px;
+      white-space:pre-wrap;word-break:break-word;color:var(--text-secondary);
+      font-family:'JetBrains Mono','Fira Code',monospace}
+    code{background:rgba(99,102,241,.12);color:var(--primary);
+      padding:1px 6px;border-radius:4px;font-size:.88em;font-family:monospace}
+
+    /* ── Chat ── */
+    #chat-log{max-height:400px;overflow-y:auto;padding:12px;border:1px solid var(--border);
+      border-radius:var(--radius-sm);background:var(--bg);margin-bottom:12px}
+    .chat-msg{padding:10px 14px;border-radius:10px;margin-bottom:8px;max-width:82%;word-break:break-word}
+    .chat-msg.user{background:linear-gradient(135deg,var(--primary),var(--primary-dark));
+      margin-left:auto;text-align:right;color:#fff}
+    .chat-msg.bot{background:var(--surface2);border:1px solid var(--border);color:var(--text)}
+    .chat-msg .ts{font-size:.72em;opacity:.55;margin-top:4px}
+    .chat-input-row{display:flex;gap:8px;align-items:flex-end}
+
+    /* ── Improvements ── */
+    .improv-row{border:1px solid var(--border);border-radius:var(--radius-sm);
+      padding:14px;margin-bottom:10px;background:var(--surface2);transition:border-color .2s}
+    .improv-row:hover{border-color:rgba(99,102,241,.3)}
+    .improv-row h4{color:var(--text);font-size:.9em;margin-bottom:4px}
+    .improv-row p{font-size:.83em;color:var(--text-secondary);margin-bottom:8px;line-height:1.5}
+
+    /* ── Scheduler ── */
+    .sched-row{border:1px solid var(--border);border-radius:var(--radius-sm);
+      padding:12px 14px;margin-bottom:10px;background:var(--surface2);
+      display:flex;align-items:flex-start;gap:12px}
+    .sched-info{flex:1}
+    .sched-info h4{color:var(--text);font-size:.88em;margin-bottom:3px;display:flex;align-items:center;gap:8px}
+    .sched-info p{font-size:.8em;color:var(--text-muted)}
+
+    /* ── Toggle ── */
+    .toggle{position:relative;display:inline-block;width:38px;height:22px;flex-shrink:0}
+    .toggle input{opacity:0;width:0;height:0}
+    .slider{position:absolute;cursor:pointer;inset:0;background:var(--border);border-radius:22px;transition:.3s}
+    .slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;
+      background:#64748b;border-radius:50%;transition:.3s}
+    input:checked+.slider{background:var(--primary)}
+    input:checked+.slider:before{transform:translateX(16px);background:#fff}
+
+    /* ── Skills ── */
+    .skill-card{border:1px solid var(--border);border-radius:var(--radius-sm);
+      padding:12px;margin-bottom:8px;cursor:pointer;transition:all .2s;background:var(--surface2)}
+    .skill-card:hover{border-color:rgba(99,102,241,.4);background:rgba(99,102,241,.05)}
+    .skill-card.selected{border-color:var(--success);background:rgba(16,185,129,.05)}
+    .skill-card h5{color:var(--text);font-size:.88em;margin-bottom:3px;font-weight:600}
+    .skill-card p{font-size:.8em;color:var(--text-muted);margin:0;line-height:1.4}
+    .skill-card .tags{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px}
+    .tag{background:rgba(99,102,241,.12);color:var(--primary);border-radius:4px;
+      padding:2px 7px;font-size:.72em;font-weight:500}
+    .cat-pill{display:inline-block;padding:4px 12px;border-radius:20px;font-size:.8em;
+      cursor:pointer;border:1px solid var(--border);color:var(--text-secondary);
+      margin:2px;transition:all .2s;font-weight:500}
+    .cat-pill:hover{border-color:var(--primary);color:var(--primary)}
+    .cat-pill.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+    .skill-grid{max-height:500px;overflow-y:auto;padding-right:4px}
+    .agent-card{border:1px solid var(--border);border-radius:var(--radius-sm);
+      padding:14px;margin-bottom:8px;background:var(--surface2)}
+    .agent-card h4{color:var(--text);margin-bottom:4px;font-size:.9em;font-weight:600}
+    .agent-card p{font-size:.83em;color:var(--text-muted)}
+    #skill-search{margin-bottom:10px}
+
+    /* ── Toast ── */
+    #toast{position:fixed;bottom:24px;right:24px;min-width:220px;padding:12px 18px;
+      border-radius:var(--radius-sm);color:#fff;opacity:0;
+      transition:opacity .3s,transform .3s;pointer-events:none;z-index:9999;
+      font-size:.875em;font-weight:500;box-shadow:var(--shadow);
+      transform:translateY(10px);display:flex;align-items:center;gap:8px}
+    #toast.show{opacity:1;transform:translateY(0)}
+
+    /* ── Empty states ── */
+    .empty{text-align:center;padding:32px 16px;color:var(--text-muted)}
+    .empty .icon{font-size:2.5em;margin-bottom:10px;opacity:.5}
+    .empty p{font-size:.88em}
+
+    /* ── Divider ── */
+    hr{border:none;border-top:1px solid var(--border);margin:16px 0}
+
+    /* ── Quick actions bar ── */
+    .actions-bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+
+    /* ── Cmd reference ── */
+    .cmd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}
+    .cmd-item{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px}
+    .cmd-item code{display:block;margin-bottom:4px;font-size:.82em}
+    .cmd-item span{font-size:.78em;color:var(--text-muted)}
+  </style>
+</head>
+<body>
+<div class="app">
+
+<!-- ── Header ── -->
+<header>
+  <div class="header-left">
+    <div class="logo">🤖</div>
+    <div class="header-title">
+      <h1>AI Employee</h1>
+      <div class="sub" id="header-sub">Loading…</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="status-pill"><div class="status-dot"></div><span id="header-status">Running</span></div>
+  </div>
+</header>
+
+<!-- ── Navigation ── -->
+<nav>
+  <button class="active" onclick="switchTab('dashboard',this)">📊 Dashboard</button>
+  <button onclick="switchTab('chat',this)">💬 Chat</button>
+  <button onclick="switchTab('tasks',this)">🚀 Tasks</button>
+  <button onclick="switchTab('swarm',this)">🐝 Swarm</button>
+  <button onclick="switchTab('commands',this)">📜 Commands</button>
+  <button onclick="switchTab('scheduler',this)">📅 Scheduler</button>
+  <button onclick="switchTab('workers',this)">👷 Workers</button>
+  <button onclick="switchTab('improvements',this)">💡 Improvements</button>
+  <button onclick="switchTab('skills',this)">🛠️ Skills</button>
+</nav>
+
+<main>
+
+<!-- ── Dashboard ── -->
+<div id="tab-dashboard" class="tab-content active">
+  <div class="grid-stat" id="stat-cards">
+    <div class="stat-card">
+      <div class="stat-icon green">🟢</div>
+      <div class="stat-body"><div class="val" id="stat-running">–</div><div class="lbl">Bots Running</div></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon blue">🤖</div>
+      <div class="stat-body"><div class="val" id="stat-total">–</div><div class="lbl">Total Bots</div></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon cyan">📡</div>
+      <div class="stat-body"><div class="val" id="stat-gateway">–</div><div class="lbl">Gateway</div></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon yellow">⏱️</div>
+      <div class="stat-body"><div class="val" id="stat-uptime">–</div><div class="lbl">Uptime</div></div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title"><span class="icon">🤖</span> Bot Status</div>
+        <button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Refresh</button>
+      </div>
+      <div id="bot-status-list"><div class="empty"><div class="icon">🔍</div><p>Loading bots…</p></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title"><span class="icon">⚡</span> Quick Actions</div>
+      </div>
+      <div class="actions-bar">
+        <button class="btn btn-success" onclick="startAll()">▶ Start All</button>
+        <button class="btn btn-danger" onclick="stopAll()">■ Stop All</button>
+        <a class="btn btn-ghost btn-sm" href="http://localhost:18789" target="_blank">📡 Gateway</a>
+      </div>
+      <hr>
+      <div class="card-title" style="margin-bottom:10px"><span class="icon">🔧</span> System Info</div>
+      <pre id="system-info" style="font-size:.78em">Click Refresh on the left to load…</pre>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">💬</span> WhatsApp Commands</div>
+    </div>
+    <div class="cmd-grid">
+      <div class="cmd-item"><code>status</code><span>Get current status report</span></div>
+      <div class="cmd-item"><code>workers</code><span>List active workers</span></div>
+      <div class="cmd-item"><code>schedule</code><span>List scheduled tasks</span></div>
+      <div class="cmd-item"><code>improvements</code><span>List pending proposals</span></div>
+      <div class="cmd-item"><code>switch to &lt;agent&gt;</code><span>Switch active agent</span></div>
+      <div class="cmd-item"><code>help</code><span>Show all commands</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Chat ── -->
+<div id="tab-chat" class="tab-content">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">💬</span> Chat / Task Input</div>
+      <button class="btn btn-ghost btn-sm" onclick="loadChatLog()">↻ Refresh</button>
+    </div>
+    <p style="color:var(--text-muted);font-size:.85em;margin-bottom:14px">
+      Send tasks here — same as WhatsApp. Tasks are processed by the active agent.
+    </p>
+    <div id="chat-log"><div class="empty"><div class="icon">💬</div><p>No messages yet.</p></div></div>
+    <div class="chat-input-row">
+      <div style="flex:1">
+        <textarea id="chat-input" placeholder="Type a task or question…" rows="2"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
+      </div>
+      <button class="btn btn-primary" onclick="sendChat()" style="height:44px">Send ↗</button>
+    </div>
+    <p style="font-size:.75em;color:var(--text-muted);margin-top:6px">Press Enter to send · Shift+Enter for new line</p>
+  </div>
+</div>
+
+<!-- ── Scheduler ── -->
+<div id="tab-scheduler" class="tab-content">
+  <div class="grid2">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title"><span class="icon">📅</span> Scheduled Tasks</div>
+        <button class="btn btn-ghost btn-sm" onclick="loadSchedules()">↻ Refresh</button>
+      </div>
+      <div id="schedule-list"><div class="empty"><div class="icon">📅</div><p>No tasks yet.</p></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title"><span class="icon">➕</span> Add New Task</div>
+      </div>
+      <div class="form-group"><label>Task ID (unique)</label><input id="sched-id" placeholder="my_task_1"/></div>
+      <div class="form-group"><label>Label</label><input id="sched-label" placeholder="Hourly status report"/></div>
+      <div class="form-group">
+        <label>Action</label>
+        <select id="sched-action">
+          <option value="log">Log message</option>
+          <option value="start_bot">Start bot</option>
+          <option value="stop_bot">Stop bot</option>
+          <option value="status_report">Send status report</option>
+        </select>
+      </div>
+      <div class="form-group" id="sched-bot-row" style="display:none">
+        <label>Bot name</label><input id="sched-bot" placeholder="status-reporter"/>
+      </div>
+      <div class="form-group"><label>Message (for log action)</label><input id="sched-msg" placeholder="Task ran"/></div>
+      <div class="form-group">
+        <label>Schedule type</label>
+        <select id="sched-type">
+          <option value="interval">Interval (every N minutes)</option>
+          <option value="daily">Daily at time (UTC)</option>
+        </select>
+      </div>
+      <div class="form-group" id="sched-interval-row">
+        <label>Interval (minutes)</label><input id="sched-interval" type="number" value="60" min="1"/>
+      </div>
+      <div class="form-group" id="sched-daily-row" style="display:none">
+        <label>Run at (HH:MM UTC)</label><input id="sched-daily-time" placeholder="08:00"/>
+      </div>
+      <button class="btn btn-success" onclick="addSchedule()">➕ Add Task</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Workers ── -->
+<div id="tab-workers" class="tab-content">
+
+  <!-- Worker Bundles section -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">🏭</span> Worker Bundles</div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-ghost btn-sm" onclick="loadWorkers()">↻ Refresh</button>
+        <button class="btn btn-primary btn-sm" onclick="openCreateWorker()">＋ New Worker</button>
+      </div>
+    </div>
+    <p style="color:var(--text-muted);font-size:.84em;margin-bottom:14px">
+      Bundle agents together with a recurring task. Workers run on a schedule and always perform their assigned role.
+      <strong style="color:var(--accent)">Ecom Workers auto-preset</strong> is included below.
+    </p>
+    <div id="bundle-list"><div class="empty"><div class="icon">🏭</div><p>No worker bundles yet. Click <strong>+ New Worker</strong> to create one.</p></div></div>
+  </div>
+
+  <!-- Create / Edit Worker Bundle form (inline, hidden by default) -->
+  <div id="worker-form-card" class="card" style="display:none;border:2px solid var(--primary)">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">✏️</span> <span id="worker-form-title">Create Worker Bundle</span></div>
+      <button class="btn btn-ghost btn-sm" onclick="closeWorkerForm()">✕ Cancel</button>
+    </div>
+    <div class="grid2" style="gap:12px">
+      <div>
+        <div class="form-group">
+          <label>Worker Name</label>
+          <input id="wf-name" placeholder="e.g. Ecom Order Processor" />
+        </div>
+        <div class="form-group">
+          <label>Recurring Task / Role Description</label>
+          <textarea id="wf-task" rows="3" placeholder="e.g. Monitor new Shopify orders, validate payments, place Printful orders, send customer tracking emails"
+            style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);padding:10px;font-family:inherit;resize:vertical"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Schedule</label>
+          <select id="wf-schedule" style="width:100%">
+            <option value="continuous">Continuous (always on)</option>
+            <option value="hourly">Every hour</option>
+            <option value="every6h">Every 6 hours</option>
+            <option value="daily">Daily (2 AM)</option>
+            <option value="3x_daily">3× daily (9 AM / 3 PM / 8 PM)</option>
+            <option value="weekly">Weekly</option>
+            <option value="manual">Manual trigger only</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <input id="wf-desc" placeholder="Short description of what this worker does" />
+        </div>
+      </div>
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <label style="font-weight:600">Assign Agents <span id="wf-agent-count" style="color:var(--primary)"></span></label>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-ghost btn-sm" onclick="wfSelectAll()">All</button>
+            <button class="btn btn-ghost btn-sm" onclick="wfClearAll()">None</button>
+          </div>
+        </div>
+        <div id="wf-agent-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:5px;max-height:300px;overflow-y:auto"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-success" onclick="saveWorkerBundle()" style="flex:1" id="wf-save-btn">💾 Save Worker</button>
+      <button class="btn btn-ghost" onclick="presetEcomWorker()" title="Fill in the full ecom automation preset">🛒 Ecom Preset</button>
+    </div>
+    <div id="wf-save-result" style="margin-top:8px;font-size:.84em"></div>
+    <input type="hidden" id="wf-editing-id" value="" />
+  </div>
+
+  <!-- Bot Workers section (raw bots start/stop) -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">👷</span> Bot Workers</div>
+      <button class="btn btn-ghost btn-sm" onclick="loadWorkers()">↻ Refresh</button>
+    </div>
+    <p style="color:var(--text-muted);font-size:.84em;margin-bottom:14px">
+      Start or stop individual bots. The problem-solver watchdog auto-restarts enabled bots if they crash.
+    </p>
+    <div id="worker-list"><div class="empty"><div class="icon">👷</div><p>Loading workers…</p></div></div>
+  </div>
+</div>
+
+<!-- ── Improvements ── -->
+<div id="tab-improvements" class="tab-content">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">💡</span> Improvement Proposals</div>
+      <button class="btn btn-ghost btn-sm" onclick="loadImprovements()">↻ Refresh</button>
+    </div>
+    <p style="color:var(--text-muted);font-size:.85em;margin-bottom:14px">
+      The discovery bot proposes new skills and markets. Review and approve or reject below.
+      <strong style="color:var(--warning)">No changes are applied automatically.</strong>
+    </p>
+    <div id="improvement-list"><div class="empty"><div class="icon">💡</div><p>No proposals yet. The discovery bot will add proposals over time.</p></div></div>
+  </div>
+</div>
+
+<!-- ── Skills ── -->
+<div id="tab-skills" class="tab-content">
+  <div class="grid2">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title"><span class="icon">🛠️</span> Skills Library <span id="skill-total-badge" style="font-size:.8em;color:var(--text-muted)"></span></div>
+      </div>
+      <input id="skill-search" placeholder="Search skills…" oninput="filterSkills()" />
+      <div id="category-pills" style="margin:10px 0"></div>
+      <div id="skill-grid" class="skill-grid"><div class="empty"><div class="icon">🛠️</div><p>Loading skills…</p></div></div>
+    </div>
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">🤖</span> Create Custom Agent</div>
+        </div>
+        <p style="color:var(--text-muted);font-size:.85em;margin-bottom:14px">Select skills from the library, name your agent, then click Create.</p>
+        <div class="form-group"><label>Agent Name</label><input id="agent-name-input" placeholder="e.g. My Content Writer"/></div>
+        <div class="form-group"><label>Description (optional)</label><input id="agent-desc-input" placeholder="What this agent does"/></div>
+        <div class="form-group">
+          <label>Selected Skills <span id="selected-count" style="color:var(--primary)">(0)</span></label>
+          <div id="selected-skills-list" style="font-size:.82em;color:var(--text-muted);min-height:24px">No skills selected. Click cards on the left.</div>
+        </div>
+        <button class="btn btn-success" onclick="createAgent()">➕ Create Agent</button>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">👥</span> Custom Agents</div>
+          <button class="btn btn-ghost btn-sm" onclick="loadAgents()">↻ Refresh</button>
+        </div>
+        <div id="agents-list"><div class="empty"><div class="icon">👥</div><p>No agents yet.</p></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Tasks ── -->
+<div id="tab-tasks" class="tab-content">
+
+  <!-- Task Builder -->
+  <div class="grid2" style="align-items:start">
+    <!-- Left: build a task -->
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">🚀</span> Build a Task</div>
+          <span id="task-step-badge" style="font-size:.78em;background:var(--primary);color:#fff;padding:2px 8px;border-radius:10px">Step 1</span>
+        </div>
+        <p style="color:var(--text-muted);font-size:.84em;margin-bottom:14px">Describe any goal — agents will be auto-selected. You can adjust everything before launching.</p>
+
+        <!-- Step 1: description -->
+        <div id="task-step1">
+          <div class="form-group">
+            <label>Task Description</label>
+            <textarea id="task-input" rows="4"
+              placeholder="e.g. Build a SaaS company for remote team management — create business plan, brand identity, hiring plan, financial model, and go-to-market strategy"
+              style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);padding:10px;font-family:inherit;resize:vertical"
+              oninput="onTaskInputChange()"></textarea>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-primary" onclick="runAutoSelect()" style="flex:1" id="btn-autoselect" disabled>🤖 Auto-Select Agents</button>
+            <button class="btn btn-ghost btn-sm" onclick="showManualAgentPicker()" title="Manually pick agents">⚙️ Manual</button>
+          </div>
+          <div id="autoselect-status" style="margin-top:8px;font-size:.82em;color:var(--text-muted)"></div>
+        </div>
+
+        <!-- Step 2: agent picker (hidden until auto-select or manual click) -->
+        <div id="task-step2" style="display:none;margin-top:16px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <label style="font-weight:600">🤖 Agent Selection <span id="agent-sel-count" style="color:var(--primary);font-weight:700"></span></label>
+            <div style="display:flex;gap:6px">
+              <button class="btn btn-ghost btn-sm" onclick="selectAllAgents()">All</button>
+              <button class="btn btn-ghost btn-sm" onclick="clearAllAgents()">None</button>
+              <button class="btn btn-ghost btn-sm" onclick="resetToAutoSelected()">Auto</button>
+            </div>
+          </div>
+          <div id="agent-picker-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:6px;max-height:340px;overflow-y:auto;padding:2px"></div>
+        </div>
+
+        <!-- Step 3: mode + submit (hidden until agents selected) -->
+        <div id="task-step3" style="display:none;margin-top:16px">
+          <div class="form-group">
+            <label>Execution Mode</label>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px" id="mode-selector">
+              <label id="mode-auto" onclick="setMode('auto')" style="cursor:pointer;border:2px solid var(--primary);border-radius:var(--radius-sm);padding:8px 4px;text-align:center;background:var(--surface2)">
+                <div style="font-size:1.2em">🧠</div>
+                <div style="font-size:.75em;font-weight:600;margin-top:2px">Auto</div>
+                <div style="font-size:.68em;color:var(--text-muted)">Orchestrator decides</div>
+              </label>
+              <label id="mode-parallel" onclick="setMode('parallel')" style="cursor:pointer;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 4px;text-align:center;background:var(--surface2)">
+                <div style="font-size:1.2em">⚡</div>
+                <div style="font-size:.75em;font-weight:600;margin-top:2px">Parallel</div>
+                <div style="font-size:.68em;color:var(--text-muted)">All agents at once</div>
+              </label>
+              <label id="mode-single" onclick="setMode('single')" style="cursor:pointer;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 4px;text-align:center;background:var(--surface2)">
+                <div style="font-size:1.2em">1️⃣</div>
+                <div style="font-size:.75em;font-weight:600;margin-top:2px">Single</div>
+                <div style="font-size:.68em;color:var(--text-muted)">First selected agent</div>
+              </label>
+            </div>
+          </div>
+          <button class="btn btn-success" onclick="submitTask()" style="width:100%;margin-top:4px" id="btn-launch">🚀 Launch Task</button>
+          <div id="task-submit-result" style="margin-top:10px;font-size:.88em"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: active task -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title"><span class="icon">📊</span> Active Task</div>
+        <button class="btn btn-ghost btn-sm" onclick="loadTasks()">↻ Refresh</button>
+      </div>
+      <div id="active-task-panel"><div class="empty"><div class="icon">🚀</div><p>No active task.</p></div></div>
+    </div>
+  </div>
+
+  <!-- Task History -->
+  <div class="card" style="margin-top:16px">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">📋</span> Recent Tasks</div>
+    </div>
+    <div id="task-history-list"><div class="empty"><p>No task history yet.</p></div></div>
+  </div>
+</div>
+
+<!-- ── Swarm ── -->
+<div id="tab-swarm" class="tab-content">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">🐝</span> Agent Swarm Overview</div>
+      <button class="btn btn-ghost btn-sm" onclick="loadSwarm()">↻ Refresh</button>
+    </div>
+    <p style="color:var(--text-muted);font-size:.85em;margin-bottom:16px">All 20 AI agents — their capabilities, current status, and workload.</p>
+    <div id="swarm-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px"><div class="empty"><div class="icon">🐝</div><p>Loading agents…</p></div></div>
+  </div>
+</div>
+
+<!-- ── Commands ── -->
+<div id="tab-commands" class="tab-content">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title"><span class="icon">📜</span> WhatsApp Commands Reference</div>
+    </div>
+    <p style="color:var(--text-muted);font-size:.84em;margin-bottom:12px">Every command works on WhatsApp AND in the Chat tab. Click any command to copy it.</p>
+    <input id="cmd-search" placeholder="🔍 Search commands…" oninput="filterCommands()" style="width:100%;margin-bottom:14px" />
+    <div id="cmd-category-pills" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px"></div>
+    <div id="cmd-list"></div>
+  </div>
+</div>
+
+</main>
+</div><!-- .app -->
+
+<div id="toast"></div>
+
+<script>
+let currentTab = 'dashboard';
+const _startTime = Date.now();
+
+function switchTab(tab, btn) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  btn.classList.add('active');
+  currentTab = tab;
+  if (tab === 'dashboard') loadDashboard();
+  if (tab === 'chat') loadChatLog();
+  if (tab === 'scheduler') loadSchedules();
+  if (tab === 'workers') { loadWorkers(); if (!_allAgents.length) loadSwarm(); }
+  if (tab === 'improvements') loadImprovements();
+  if (tab === 'skills') loadSkills();
+  if (tab === 'tasks') loadTasks();
+  if (tab === 'swarm') loadSwarm();
+  if (tab === 'commands') loadCommandsTab();
+}
+
+function toast(msg, color='#10b981') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.background = color;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+async function api(path, opts={}) {
+  try {
+    const r = await fetch(path, opts);
+    return r.json();
+  } catch(e) {
+    return {error: String(e)};
+  }
+}
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
+async function loadDashboard() {
+  const d = await api('/api/status');
+  const bots = d.bots || [];
+  const running = bots.filter(b => b.running).length;
+  const total = bots.length;
+
+  document.getElementById('stat-running').textContent = running;
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('header-sub').textContent = `${running}/${total} bots running`;
+
+  // Uptime
+  const secs = Math.floor((Date.now() - _startTime) / 1000);
+  document.getElementById('stat-uptime').textContent =
+    secs < 60 ? secs + 's' : secs < 3600 ? Math.floor(secs/60) + 'm' : Math.floor(secs/3600) + 'h';
+
+  // Gateway status (try to ping)
+  fetch('http://localhost:18789', {mode:'no-cors',signal:AbortSignal.timeout(1500)})
+    .then(() => document.getElementById('stat-gateway').textContent = 'Online')
+    .catch(() => document.getElementById('stat-gateway').textContent = 'Offline');
+
+  const el = document.getElementById('bot-status-list');
+  if (!bots.length) {
+    el.innerHTML = '<div class="empty"><div class="icon">🤖</div><p>No bot state data yet. Start the bots first.</p></div>';
+  } else {
+    el.innerHTML = bots.map(b => {
+      const cls = b.running ? 'on' : 'off';
+      const lbl = b.running ? 'running' : 'stopped';
+      return `<div class="bot-row">
+        <div class="dot ${cls}"></div>
+        <span class="bot-name">${b.bot}</span>
+        <span class="badge ${lbl}">${lbl}</span>
+      </div>`;
+    }).join('');
+  }
+
+  const sys = await api('/api/doctor');
+  document.getElementById('system-info').textContent = sys.output || '(no output)';
+}
+
+async function startAll() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '…';
+  await api('/api/bots/start-all', {method:'POST'});
+  toast('Starting all bots…');
+  setTimeout(() => { loadDashboard(); btn.disabled=false; btn.textContent='▶ Start All'; }, 2500);
+}
+
+async function stopAll() {
+  if (!confirm('Stop all running bots?')) return;
+  await api('/api/bots/stop-all', {method:'POST'});
+  toast('Stopping all bots…', '#ef4444');
+  setTimeout(loadDashboard, 2000);
+}
+
+// ── Chat ────────────────────────────────────────────────────────────────────
+async function loadChatLog() {
+  const data = await api('/api/chat');
+  const log = document.getElementById('chat-log');
+  const msgs = data.messages || [];
+  if (!msgs.length) {
+    log.innerHTML = '<div class="empty"><div class="icon">💬</div><p>No messages yet.</p></div>';
+    return;
+  }
+  log.innerHTML = msgs.slice(-60).map(m => {
+    const type = m.type === 'user' ? 'user' : 'bot';
+    const raw = m.message || m.question || JSON.stringify(m);
+    // HTML-escape to prevent XSS, then convert newlines to <br>
+    const text = raw.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                    .replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/\n/g,'<br>');
+    const ts = (m.ts||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return `<div class="chat-msg ${type}"><div>${text}</div><div class="ts">${ts}</div></div>`;
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = '';
+  await api('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message: q})});
+  loadChatLog();
+}
+
+// ── Scheduler ───────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('sched-action').addEventListener('change', function() {
+    document.getElementById('sched-bot-row').style.display = (this.value==='start_bot'||this.value==='stop_bot') ? '' : 'none';
+  });
+  document.getElementById('sched-type').addEventListener('change', function() {
+    document.getElementById('sched-interval-row').style.display = this.value==='interval' ? '' : 'none';
+    document.getElementById('sched-daily-row').style.display = this.value==='daily' ? '' : 'none';
+  });
+});
+
+async function loadSchedules() {
+  const data = await api('/api/schedules');
+  const tasks = data.tasks || [];
+  const el = document.getElementById('schedule-list');
+  if (!tasks.length) { el.innerHTML = '<div class="empty"><div class="icon">📅</div><p>No scheduled tasks yet.</p></div>'; return; }
+  el.innerHTML = tasks.map(t => {
+    const info = t.type==='interval' ? `every ${t.interval_minutes||60}m` : `daily at ${t.run_at_utc||'?'} UTC`;
+    const enabled = t.enabled !== false;
+    return `<div class="sched-row">
+      <div class="sched-info">
+        <h4>${t.label||t.id} <span class="badge ${enabled?'enabled':'disabled'}">${enabled?'enabled':'disabled'}</span></h4>
+        <p>${t.action} · ${info}</p>
+      </div>
+      <button class="btn btn-danger btn-sm" onclick="deleteSchedule('${t.id}')">✕</button>
+    </div>`;
+  }).join('');
+}
+
+async function addSchedule() {
+  const id = document.getElementById('sched-id').value.trim();
+  const label = document.getElementById('sched-label').value.trim();
+  const action = document.getElementById('sched-action').value;
+  const bot = document.getElementById('sched-bot').value.trim();
+  const msg = document.getElementById('sched-msg').value.trim();
+  const type = document.getElementById('sched-type').value;
+  const interval = parseInt(document.getElementById('sched-interval').value) || 60;
+  const dailyTime = document.getElementById('sched-daily-time').value.trim();
+
+  if (!id || !label) { toast('ID and label are required', '#ef4444'); return; }
+
+  const task = {id, label, action, type, enabled: true,
+    ...(bot && {bot}), ...(msg && {message: msg}),
+    ...(type==='interval' && {interval_minutes: interval}),
+    ...(type==='daily' && {run_at_utc: dailyTime||'08:00'}),
+  };
+
+  const r = await api('/api/schedules', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(task)});
+  if (r.ok) { toast('Task added!'); loadSchedules(); }
+  else { toast(r.error||'Error', '#ef4444'); }
+}
+
+async function deleteSchedule(id) {
+  if (!confirm(`Delete task "${id}"?`)) return;
+  const r = await api(`/api/schedules/${id}`, {method:'DELETE'});
+  if (r.ok) { toast('Task deleted'); loadSchedules(); }
+}
+
+// ── Workers ─────────────────────────────────────────────────────────────────
+// ── Bundle management ───────────────────────────────────────────────────────
+let _wfSelectedAgents = new Set();
+
+async function loadWorkers() {
+  // Load bundles
+  const bd = await api('/api/workers/bundles');
+  const bundles = (bd && bd.bundles) || [];
+  const bundleEl = document.getElementById('bundle-list');
+  if (!bundles.length) {
+    bundleEl.innerHTML = '<div class="empty"><div class="icon">🏭</div><p>No worker bundles yet. Click <strong>+ New Worker</strong> to create one.</p></div>';
+  } else {
+    bundleEl.innerHTML = bundles.map(b => {
+      const enabled = b.enabled !== false;
+      const statusColor = enabled ? '#10b981' : '#64748b';
+      const agents = (b.agents || []).map(a => `<span style="background:var(--surface2);padding:1px 6px;border-radius:3px;font-size:.73em">${escHtml(a)}</span>`).join(' ');
+      const schedMap = {continuous:'🔄 Continuous', hourly:'⏰ Hourly', every6h:'⏰ Every 6h', daily:'🌙 Daily 2AM', '3x_daily':'☀️ 3× Daily', weekly:'📅 Weekly', manual:'🖱 Manual'};
+      const schedLabel = schedMap[b.schedule] || b.schedule || 'manual';
+      const lastRun = b.last_run ? `Last: ${b.last_run.split('T')[0]}` : 'Never run';
+      return `<div style="border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:10px;border-left:4px solid ${statusColor}">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+          <div style="flex:1">
+            <div style="font-weight:700;font-size:.95em;display:flex;align-items:center;gap:6px">
+              🏭 ${escHtml(b.name)}
+              <span style="font-size:.72em;background:${statusColor};color:#fff;border-radius:3px;padding:1px 6px">${enabled ? 'enabled' : 'disabled'}</span>
+              <span style="font-size:.72em;color:var(--text-muted)">${schedLabel}</span>
+            </div>
+            <div style="font-size:.82em;color:var(--text-secondary);margin:4px 0">${escHtml(b.description || b.task_description || '')}</div>
+            <div style="font-size:.8em;color:var(--text-muted);margin-bottom:6px;line-height:1.5">${escHtml((b.task_description||'').slice(0,120))}${(b.task_description||'').length>120?'…':''}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:3px">${agents}</div>
+            <div style="font-size:.72em;color:var(--text-muted);margin-top:5px">${lastRun}</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:5px;min-width:90px">
+            <button class="btn btn-primary btn-sm" onclick="runBundle('${escHtml(b.id)}')">▶ Run</button>
+            <button class="btn btn-ghost btn-sm" onclick="editBundle(${escHtml(JSON.stringify(b))})">✏️ Edit</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleBundle('${escHtml(b.id)}', ${!enabled})">${enabled ? '⏸ Disable' : '▶ Enable'}</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteBundle('${escHtml(b.id)}')">🗑</button>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  // Load bot workers
+  const wd = await api('/api/workers');
+  const bots = (wd && wd.bots) || [];
+  const el = document.getElementById('worker-list');
+  if (!bots.length) { el.innerHTML = '<div class="empty"><div class="icon">👷</div><p>No bots found.</p></div>'; return; }
+  el.innerHTML = bots.map(b => {
+    const cls = b.running ? 'on' : 'off';
+    const lbl = b.running ? 'running' : 'stopped';
+    const startBtn = b.running ? '' : `<button class="btn btn-success btn-sm" onclick="startBot('${b.name}')">▶ Start</button>`;
+    const stopBtn = b.running ? `<button class="btn btn-danger btn-sm" onclick="stopBot('${b.name}')">■ Stop</button>` : '';
+    return `<div class="sched-row">
+      <div class="dot ${cls}" style="margin-top:4px;flex-shrink:0"></div>
+      <div class="sched-info"><h4>${b.name} <span class="badge ${lbl}">${lbl}</span></h4></div>
+      <div style="display:flex;gap:6px">${startBtn}${stopBtn}</div>
+    </div>`;
+  }).join('');
+}
+
+function openCreateWorker(prefill) {
+  document.getElementById('wf-editing-id').value = '';
+  document.getElementById('wf-name').value = (prefill && prefill.name) || '';
+  document.getElementById('wf-task').value = (prefill && prefill.task_description) || '';
+  document.getElementById('wf-desc').value = (prefill && prefill.description) || '';
+  document.getElementById('wf-schedule').value = (prefill && prefill.schedule) || 'continuous';
+  document.getElementById('worker-form-title').textContent = 'Create Worker Bundle';
+  document.getElementById('wf-save-btn').textContent = '💾 Save Worker';
+  document.getElementById('wf-save-result').textContent = '';
+  _wfSelectedAgents = new Set((prefill && prefill.agents) || []);
+  renderWfAgentGrid();
+  document.getElementById('worker-form-card').style.display = 'block';
+  document.getElementById('worker-form-card').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function editBundle(b) {
+  openCreateWorker(b);
+  document.getElementById('wf-editing-id').value = b.id;
+  document.getElementById('worker-form-title').textContent = 'Edit Worker Bundle';
+  document.getElementById('wf-save-btn').textContent = '💾 Update Worker';
+}
+
+function closeWorkerForm() {
+  document.getElementById('worker-form-card').style.display = 'none';
+  _wfSelectedAgents.clear();
+}
+
+function renderWfAgentGrid() {
+  const grid = document.getElementById('wf-agent-grid');
+  if (!_allAgents.length) {
+    grid.innerHTML = '<p style="color:var(--text-muted);font-size:.82em">Agents not loaded yet. Open Tasks tab first to load agent list.</p>';
+    return;
+  }
+  grid.innerHTML = _allAgents.map(a => {
+    const sel = _wfSelectedAgents.has(a.id);
+    const color = _catColors[a.category] || '#64748b';
+    return `<div id="wfcard-${a.id}" onclick="toggleWfAgent('${escHtml(a.id)}')"
+      style="cursor:pointer;border:2px solid ${sel ? color : 'var(--border)'};border-radius:var(--radius-sm);padding:6px;background:${sel ? 'var(--surface2)' : 'var(--surface)'};transition:all .15s">
+      <div style="font-size:.75em;font-weight:600;color:${sel ? color : 'var(--text)'}">${escHtml(a.id)}</div>
+      <div style="font-size:.65em;color:var(--text-muted)">${escHtml(a.category||'')}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('wf-agent-count').textContent = `(${_wfSelectedAgents.size} selected)`;
+}
+
+function toggleWfAgent(id) {
+  if (_wfSelectedAgents.has(id)) _wfSelectedAgents.delete(id);
+  else _wfSelectedAgents.add(id);
+  const a = _allAgents.find(x => x.id === id);
+  const card = document.getElementById('wfcard-' + id);
+  if (!card || !a) return;
+  const sel = _wfSelectedAgents.has(id);
+  const color = _catColors[a.category] || '#64748b';
+  card.style.border = `2px solid ${sel ? color : 'var(--border)'}`;
+  card.style.background = sel ? 'var(--surface2)' : 'var(--surface)';
+  card.querySelector('div').style.color = sel ? color : 'var(--text)';
+  document.getElementById('wf-agent-count').textContent = `(${_wfSelectedAgents.size} selected)`;
+}
+
+function wfSelectAll() { _allAgents.forEach(a => _wfSelectedAgents.add(a.id)); renderWfAgentGrid(); }
+function wfClearAll()  { _wfSelectedAgents.clear(); renderWfAgentGrid(); }
+
+function presetEcomWorker() {
+  const preset = {
+    name: 'E-commerce Automation Worker',
+    description: 'Full 100% automated e-commerce operation — orders, support, inventory, marketing, and reporting.',
+    task_description: 'Run the full e-commerce automation pipeline: process new orders via Shopify webhook, handle customer support tickets, sync inventory with supplier, run email marketing campaigns, post to social media, research new products, and generate daily P&L reports.',
+    schedule: 'continuous',
+    agents: ['order-processor','support-bot','bookkeeper','inventory-sync','email-marketer','social-poster','product-researcher','ecom-dashboard']
+  };
+  openCreateWorker(preset);
+  toast('E-commerce preset loaded! Adjust agents and save.', '#10b981');
+}
+
+async function saveWorkerBundle() {
+  const name = document.getElementById('wf-name').value.trim();
+  const task_description = document.getElementById('wf-task').value.trim();
+  const description = document.getElementById('wf-desc').value.trim();
+  const schedule = document.getElementById('wf-schedule').value;
+  const agents = [..._wfSelectedAgents];
+  const editingId = document.getElementById('wf-editing-id').value.trim();
+  const resultEl = document.getElementById('wf-save-result');
+
+  if (!name) { toast('Worker name is required', '#ef4444'); return; }
+  if (!task_description) { toast('Task description is required', '#ef4444'); return; }
+  if (!agents.length) { toast('Select at least one agent', '#ef4444'); return; }
+
+  resultEl.textContent = '⏳ Saving…';
+  const payload = {name, description, task_description, schedule, agents, enabled: true};
+
+  let r;
+  if (editingId) {
+    r = await api(`/api/workers/bundles/${editingId}`, {method:'PATCH', body: JSON.stringify(payload)});
+  } else {
+    r = await api('/api/workers/bundles', {method:'POST', body: JSON.stringify(payload)});
+  }
+
+  if (r && r.ok !== false) {
+    resultEl.innerHTML = `<span style="color:var(--success)">✅ Worker ${editingId ? 'updated' : 'created'}!</span>`;
+    setTimeout(() => { closeWorkerForm(); loadWorkers(); }, 800);
+  } else {
+    resultEl.innerHTML = `<span style="color:var(--danger)">❌ Save failed. Check API.</span>`;
+  }
+}
+
+async function runBundle(id) {
+  const r = await api(`/api/workers/bundles/${id}/run`, {method:'POST'});
+  if (r && r.ok !== false) toast('Worker triggered ▶', '#10b981');
+  else toast('Run failed', '#ef4444');
+  setTimeout(loadWorkers, 1500);
+}
+
+async function toggleBundle(id, enabled) {
+  const r = await api(`/api/workers/bundles/${id}`, {method:'PATCH', body: JSON.stringify({enabled})});
+  if (r && r.ok !== false) toast(enabled ? 'Worker enabled ✅' : 'Worker disabled ⏸', enabled ? '#10b981' : '#f59e0b');
+  else toast('Update failed', '#ef4444');
+  loadWorkers();
+}
+
+async function deleteBundle(id) {
+  if (!confirm('Delete this worker bundle?')) return;
+  const r = await api(`/api/workers/bundles/${id}`, {method:'DELETE'});
+  if (r && r.ok !== false) { toast('Worker deleted', '#ef4444'); loadWorkers(); }
+  else toast('Delete failed', '#ef4444');
+}
+
+async function startBot(name) {
+  await api('/api/bots/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bot: name})});
+  toast(`Starting ${name}…`);
+  setTimeout(loadWorkers, 1800);
+}
+
+async function stopBot(name) {
+  if (!confirm(`Stop ${name}?`)) return;
+  await api('/api/bots/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bot: name})});
+  toast(`Stopping ${name}…`, '#ef4444');
+  setTimeout(loadWorkers, 1800);
+}
+
+// ── Improvements ────────────────────────────────────────────────────────────
+async function loadImprovements() {
+  const data = await api('/api/improvements');
+  const items = data.improvements || [];
+  const el = document.getElementById('improvement-list');
+  if (!items.length) { el.innerHTML = '<div class="empty"><div class="icon">💡</div><p>No proposals yet. The discovery bot will add them over time.</p></div>'; return; }
+  el.innerHTML = items.map(imp => `
+    <div class="improv-row">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+        <h4>${imp.title||imp.id} <span class="badge ${imp.status||'pending'}">${imp.status||'pending'}</span></h4>
+        ${imp.status==='pending' ? `<div style="display:flex;gap:6px;flex-shrink:0">
+          <button class="btn btn-success btn-sm" onclick="reviewImprovement('${imp.id}','approved')">✓ Approve</button>
+          <button class="btn btn-danger btn-sm" onclick="reviewImprovement('${imp.id}','rejected')">✕ Reject</button>
+        </div>` : ''}
+      </div>
+      <p>${imp.description||''}</p>
+      ${imp.agent ? `<p style="font-size:.78em;color:var(--primary);margin-top:4px">Agent: ${imp.agent} · Type: ${imp.type||'?'} · Effort: ${imp.effort||'?'}</p>` : ''}
+    </div>`).join('');
+}
+
+async function reviewImprovement(id, decision) {
+  const r = await api(`/api/improvements/${id}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({status: decision})});
+  if (r.ok) { toast(decision==='approved' ? '✓ Approved' : '✕ Rejected', decision==='approved'?'#10b981':'#ef4444'); loadImprovements(); }
+}
+
+// ── Skills ───────────────────────────────────────────────────────────────────
+let allSkills = [];
+let selectedSkillIds = new Set();
+let activeCategory = '';
+
+const CAT_COLORS = {
+  'Content & Writing':'#f472b6','Research & Analysis':'#60a5fa',
+  'Trading & Finance':'#34d399','Social Media':'#fb923c',
+  'Lead Generation & Sales':'#a78bfa','Customer Support':'#fbbf24',
+  'Development & Technical':'#22d3ee','Data Analysis':'#4ade80',
+  'E-commerce & Product':'#f87171','Marketing & SEO':'#c084fc',
+  'Automation & Productivity':'#e2e8f0',
+};
+
+async function loadSkills() {
+  const data = await api('/api/skills');
+  allSkills = data.skills || [];
+  document.getElementById('skill-total-badge').textContent = `(${allSkills.length})`;
+  renderCategoryPills(data.categories || []);
+  renderSkillGrid(allSkills);
+  loadAgents();
+}
+
+function renderCategoryPills(cats) {
+  const el = document.getElementById('category-pills');
+  el.innerHTML = `<span class="cat-pill active" onclick="setCat('',this)">All</span>` +
+    cats.map(c => `<span class="cat-pill" onclick="setCat(${JSON.stringify(c)},this)">${c}</span>`).join('');
+}
+
+function setCat(cat, btn) {
+  activeCategory = cat;
+  document.querySelectorAll('.cat-pill').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  filterSkills();
+}
+
+function filterSkills() {
+  const q = (document.getElementById('skill-search').value || '').toLowerCase();
+  const filtered = allSkills.filter(s => {
+    const catMatch = !activeCategory || s.category === activeCategory;
+    const textMatch = !q || s.id.includes(q) || s.name.toLowerCase().includes(q) ||
+                      s.description.toLowerCase().includes(q) ||
+                      (s.tags||[]).some(t => t.toLowerCase().includes(q));
+    return catMatch && textMatch;
+  });
+  renderSkillGrid(filtered);
+}
+
+function renderSkillGrid(skills) {
+  const el = document.getElementById('skill-grid');
+  if (!skills.length) { el.innerHTML = '<div class="empty"><div class="icon">🔍</div><p>No skills match.</p></div>'; return; }
+  el.innerHTML = skills.map(s => {
+    const color = CAT_COLORS[s.category] || '#94a3b8';
+    const sel = selectedSkillIds.has(s.id);
+    const tags = (s.tags||[]).slice(0,4).map(t=>`<span class="tag">${t}</span>`).join('');
+    return `<div class="skill-card${sel?' selected':''}" onclick="toggleSkill(${JSON.stringify(s.id)},this)">
+      <h5>${s.name} <span style="color:${color};font-size:.72em;font-weight:500">${s.category}</span></h5>
+      <p>${s.description.slice(0,110)}${s.description.length>110?'…':''}</p>
+      <div class="tags">${tags}</div>
+    </div>`;
+  }).join('');
+}
+
+function toggleSkill(id, card) {
+  if (selectedSkillIds.has(id)) { selectedSkillIds.delete(id); card.classList.remove('selected'); }
+  else { selectedSkillIds.add(id); card.classList.add('selected'); }
+  updateSelectedPanel();
+}
+
+function updateSelectedPanel() {
+  const count = selectedSkillIds.size;
+  document.getElementById('selected-count').textContent = `(${count})`;
+  const el = document.getElementById('selected-skills-list');
+  if (!count) { el.textContent = 'No skills selected. Click cards on the left.'; return; }
+  el.innerHTML = [...selectedSkillIds].map(id => {
+    const s = allSkills.find(x => x.id === id);
+    return `<span style="display:inline-flex;align-items:center;gap:4px;margin:2px 4px 2px 0;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:2px 8px;font-size:.8em">
+      ${s ? s.name : id}
+      <span onclick="selectedSkillIds.delete(${JSON.stringify(id)});updateSelectedPanel();filterSkills();"
+        style="cursor:pointer;color:var(--danger);font-weight:bold;margin-left:2px">×</span>
+    </span>`;
+  }).join('');
+}
+
+async function createAgent() {
+  const name = document.getElementById('agent-name-input').value.trim();
+  const desc = document.getElementById('agent-desc-input').value.trim();
+  if (!name) { toast('Agent name is required', '#ef4444'); return; }
+  if (!selectedSkillIds.size) { toast('Select at least one skill', '#ef4444'); return; }
+  const r = await api('/api/agents/custom', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name, description: desc, skills: [...selectedSkillIds]}),
+  });
+  if (r.ok) {
+    toast(`Agent "${name}" created with ${r.skill_count} skills!`);
+    document.getElementById('agent-name-input').value = '';
+    document.getElementById('agent-desc-input').value = '';
+    selectedSkillIds.clear();
+    updateSelectedPanel();
+    filterSkills();
+    loadAgents();
+  } else { toast(r.error || 'Error creating agent', '#ef4444'); }
+}
+
+async function loadAgents() {
+  const data = await api('/api/agents/custom');
+  const agents = data.agents || [];
+  const el = document.getElementById('agents-list');
+  if (!agents.length) { el.innerHTML = '<div class="empty"><div class="icon">👥</div><p>No agents yet. Create one above.</p></div>'; return; }
+  el.innerHTML = agents.map(a => `
+    <div class="agent-card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <h4>${a.name}</h4>
+        <button class="btn btn-danger btn-sm" onclick="deleteAgent('${a.id}')">🗑</button>
+      </div>
+      <p>${a.description || 'No description'}</p>
+      <p style="margin-top:6px;color:var(--primary);font-size:.78em">${a.skill_count} skills: ${(a.skills||[]).slice(0,5).join(', ')}${a.skill_count>5?'…':''}</p>
+    </div>`).join('');
+}
+
+async function deleteAgent(id) {
+  if (!confirm('Delete this agent?')) return;
+  const r = await api('/api/agents/custom/' + id, {method:'DELETE'});
+  if (r.ok) { toast('Agent deleted', '#ef4444'); loadAgents(); }
+}
+
+// ── Tasks — agent selector state ─────────────────────────────────────────────
+let _allAgents = [];          // full list from /api/agents
+let _autoSelectedIds = new Set(); // IDs suggested by auto-select
+let _selectedAgentIds = new Set(); // currently selected (user may adjust)
+let _taskMode = 'auto';       // 'auto' | 'parallel' | 'single'
+
+function onTaskInputChange() {
+  const v = document.getElementById('task-input').value.trim();
+  document.getElementById('btn-autoselect').disabled = !v;
+  document.getElementById('autoselect-status').textContent = '';
+}
+
+function setMode(m) {
+  _taskMode = m;
+  ['auto','parallel','single'].forEach(id => {
+    const el = document.getElementById('mode-' + id);
+    el.style.border = id === m ? '2px solid var(--primary)' : '1px solid var(--border)';
+  });
+}
+
+async function runAutoSelect() {
+  const desc = document.getElementById('task-input').value.trim();
+  if (!desc) return;
+  const statusEl = document.getElementById('autoselect-status');
+  statusEl.textContent = '⏳ Analysing task…';
+  document.getElementById('btn-autoselect').disabled = true;
+
+  // Fetch all agents if we don't have them yet
+  if (!_allAgents.length) {
+    const r = await api('/api/agents');
+    if (r.ok) { const d = await r.json(); _allAgents = d.agents || []; }
+  }
+
+  const r = await api('/api/task/auto-agents', {method:'POST', body: JSON.stringify({description: desc})});
+  if (r.ok) {
+    const d = await r.json();
+    _autoSelectedIds = new Set(d.suggested || []);
+    _selectedAgentIds = new Set(_autoSelectedIds);
+    statusEl.innerHTML = `<span style="color:var(--success)">✅ ${_autoSelectedIds.size} agent${_autoSelectedIds.size!==1?'s':''} auto-selected</span>`;
+    renderAgentPicker();
+    document.getElementById('task-step2').style.display = 'block';
+    document.getElementById('task-step3').style.display = 'block';
+    document.getElementById('task-step-badge').textContent = 'Step 2';
+  } else {
+    statusEl.innerHTML = '<span style="color:var(--danger)">❌ Auto-select failed — use Manual to pick agents</span>';
+    showManualAgentPicker();
+  }
+  document.getElementById('btn-autoselect').disabled = false;
+}
+
+async function showManualAgentPicker() {
+  if (!_allAgents.length) {
+    const r = await api('/api/agents');
+    if (r.ok) { const d = await r.json(); _allAgents = d.agents || []; }
+  }
+  renderAgentPicker();
+  document.getElementById('task-step2').style.display = 'block';
+  document.getElementById('task-step3').style.display = 'block';
+  document.getElementById('task-step-badge').textContent = 'Step 2';
+}
+
+const _catColors = {
+  coordination:'#6366f1', sales:'#10b981', content:'#22d3ee', social:'#f59e0b',
+  research:'#3b82f6', ecommerce:'#ec4899', analytics:'#8b5cf6', creative:'#ef4444',
+  trading:'#f97316', development:'#14b8a6', hr:'#84cc16', finance:'#eab308',
+  marketing:'#06b6d4', growth:'#a855f7', management:'#64748b', crypto:'#f59e0b',
+  strategy:'#6366f1', support:'#10b981'
+};
+const _catEmoji = {
+  coordination:'🎯', sales:'💼', content:'✍️', social:'📱', research:'🔍',
+  ecommerce:'🛒', analytics:'📊', creative:'🎨', trading:'📈', development:'💻',
+  hr:'👔', finance:'💰', marketing:'🚀', growth:'📈', management:'📋',
+  crypto:'🪙', strategy:'🏢', support:'🎧'
+};
+
+function renderAgentPicker() {
+  const grid = document.getElementById('agent-picker-grid');
+  if (!_allAgents.length) {
+    grid.innerHTML = '<p style="color:var(--text-muted);font-size:.84em">No agents loaded. Check /api/agents.</p>';
+    return;
+  }
+  grid.innerHTML = _allAgents.map(a => {
+    const selected = _selectedAgentIds.has(a.id);
+    const wasAuto = _autoSelectedIds.has(a.id);
+    const color = _catColors[a.category] || '#64748b';
+    const emoji = _catEmoji[a.category] || '🤖';
+    const dotColor = a.running ? '#10b981' : '#64748b';
+    return `<div id="agentcard-${a.id}"
+      onclick="toggleAgent('${escHtml(a.id)}')"
+      title="${escHtml(a.description||'')}"
+      style="cursor:pointer;border:2px solid ${selected ? color : 'var(--border)'};border-radius:var(--radius-sm);padding:8px 6px;background:${selected ? 'var(--surface2)' : 'var(--surface)'};transition:all .15s;position:relative;user-select:none">
+      ${wasAuto ? `<span style="position:absolute;top:3px;right:3px;font-size:.6em;background:${color};color:#fff;border-radius:3px;padding:1px 4px">AUTO</span>` : ''}
+      <div style="display:flex;align-items:center;gap:4px;margin-bottom:3px">
+        <span style="font-size:1em">${emoji}</span>
+        <span style="width:6px;height:6px;border-radius:50%;background:${dotColor};flex-shrink:0"></span>
+      </div>
+      <div style="font-size:.78em;font-weight:600;color:${selected ? color : 'var(--text)'};line-height:1.2">${escHtml(a.id)}</div>
+      <div style="font-size:.68em;color:var(--text-muted);margin-top:1px">${escHtml(a.category||'')}</div>
+    </div>`;
+  }).join('');
+  updateAgentSelCount();
+}
+
+function toggleAgent(id) {
+  if (_selectedAgentIds.has(id)) _selectedAgentIds.delete(id);
+  else _selectedAgentIds.add(id);
+  const a = _allAgents.find(x => x.id === id);
+  const card = document.getElementById('agentcard-' + id);
+  if (!card || !a) return;
+  const selected = _selectedAgentIds.has(id);
+  const color = _catColors[a.category] || '#64748b';
+  card.style.border = `2px solid ${selected ? color : 'var(--border)'}`;
+  card.style.background = selected ? 'var(--surface2)' : 'var(--surface)';
+  card.querySelector('div:last-child').previousElementSibling.style.color = selected ? color : 'var(--text)';
+  updateAgentSelCount();
+}
+
+function selectAllAgents() {
+  _allAgents.forEach(a => _selectedAgentIds.add(a.id));
+  renderAgentPicker();
+}
+function clearAllAgents() {
+  _selectedAgentIds.clear();
+  renderAgentPicker();
+}
+function resetToAutoSelected() {
+  _selectedAgentIds = new Set(_autoSelectedIds);
+  renderAgentPicker();
+}
+
+function updateAgentSelCount() {
+  const n = _selectedAgentIds.size;
+  document.getElementById('agent-sel-count').textContent = `(${n} selected)`;
+}
+
+async function submitTask() {
+  const desc = document.getElementById('task-input').value.trim();
+  if (!desc) { toast('Please enter a task description', '#ef4444'); return; }
+  const resultEl = document.getElementById('task-submit-result');
+  resultEl.innerHTML = '⏳ Submitting…';
+  const agents = [..._selectedAgentIds];
+  const r = await api('/api/task/submit', {method:'POST', body: JSON.stringify({
+    description: desc,
+    agents: agents,
+    mode: _taskMode
+  })});
+  if (r.ok) {
+    const d = await r.json();
+    resultEl.innerHTML = `<span style="color:var(--success)">✅ Task launched! ID: <code>${d.task_id||'?'}</code> | ${agents.length || 'auto'} agent${agents.length!==1?'s':''} | mode: ${_taskMode}</span>`;
+    document.getElementById('task-input').value = '';
+    _selectedAgentIds.clear();
+    _autoSelectedIds.clear();
+    document.getElementById('task-step2').style.display = 'none';
+    document.getElementById('task-step3').style.display = 'none';
+    document.getElementById('task-step-badge').textContent = 'Step 1';
+    document.getElementById('autoselect-status').textContent = '';
+    setTimeout(loadTasks, 2000);
+  } else {
+    resultEl.innerHTML = '<span style="color:var(--danger)">❌ Failed to submit. Is task-orchestrator running?</span>';
+  }
+}
+
+async function loadTasks() {
+  const r = await api('/api/task/list');
+  if (!r.ok) return;
+  const d = await r.json();
+  const plans = d.plans || [];
+
+  const activePanel = document.getElementById('active-task-panel');
+  const active = plans.find(p => p.status === 'running' || p.status === 'planning');
+  if (active) {
+    const subtasks = active.subtasks || [];
+    const done = subtasks.filter(s => s.status === 'done').length;
+    const pct = subtasks.length ? Math.round(done/subtasks.length*100) : 0;
+    const statusEmoji = {running:'⏳',planning:'🧠',done:'✅',failed:'❌'}[active.status]||'?';
+    const modeTag = active.mode ? `<span style="font-size:.72em;background:var(--surface2);padding:1px 6px;border-radius:3px;margin-left:6px">${active.mode}</span>` : '';
+    activePanel.innerHTML = `
+      <div style="margin-bottom:12px">
+        <div style="font-weight:600;margin-bottom:4px">${statusEmoji} ${escHtml(active.title||active.id)}${modeTag}</div>
+        <div style="font-size:.82em;color:var(--text-muted)">ID: ${active.id} | ${done}/${subtasks.length} subtasks</div>
+        <div style="background:var(--border);border-radius:4px;height:6px;margin:8px 0">
+          <div style="background:var(--primary);height:100%;width:${pct}%;border-radius:4px;transition:width .3s"></div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${subtasks.map(st => {
+          const e = {done:'✅',running:'⏳',pending:'⏸️',failed:'❌',skipped:'⏭️'}[st.status]||'?';
+          const agColor = _catColors[(_allAgents.find(a=>a.id===st.agent_id)||{}).category] || '#64748b';
+          return `<div style="display:flex;align-items:center;gap:8px;font-size:.84em;padding:4px 6px;border-radius:4px;background:var(--surface)">
+            <span>${e}</span>
+            <span style="color:${agColor};font-weight:600;min-width:110px;font-size:.9em">${escHtml(st.agent_id||'?')}</span>
+            <span style="color:var(--text-secondary);flex:1">${escHtml(st.title||st.subtask_id||'')}</span>
+            ${st.status==='pending' ? `<button class="btn btn-ghost btn-sm" style="padding:1px 6px;font-size:.7em" onclick="reassignSubtask('${escHtml(active.id)}','${escHtml(st.subtask_id||'')}')">↩ Reassign</button>` : ''}
+          </div>`;
+        }).join('')}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-ghost btn-sm" style="color:var(--danger)" onclick="cancelTask()">🛑 Cancel</button>
+        <button class="btn btn-ghost btn-sm" onclick="loadTasks()">↻ Refresh</button>
+      </div>
+    `;
+    setTimeout(loadTasks, 5000);
+  } else {
+    activePanel.innerHTML = '<div class="empty"><div class="icon">🚀</div><p>No active task. Build one on the left.</p></div>';
+  }
+
+  const histEl = document.getElementById('task-history-list');
+  const history = plans.filter(p => !['running','planning'].includes(p.status)).slice(0,10);
+  if (!history.length) { histEl.innerHTML = '<div class="empty"><p>No task history yet.</p></div>'; return; }
+  histEl.innerHTML = history.map(p => {
+    const e = {done:'✅',failed:'❌',cancelled:'🛑',timed_out:'⏰'}[p.status]||'?';
+    const agents = [...new Set((p.subtasks||[]).map(s=>s.agent_id).filter(Boolean))].join(', ');
+    const mode = p.mode ? ` · ${p.mode}` : '';
+    return `<div style="padding:10px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div style="font-weight:500">${e} ${escHtml(p.title||p.id)}</div>
+        <div style="font-size:.78em;color:var(--text-muted)">${(p.subtasks||[]).length} subtasks${mode} | Agents: ${escHtml(agents)||'—'} | ${p.created_at||''}</div>
+      </div>
+      <span style="font-size:.78em;background:var(--surface2);padding:2px 8px;border-radius:4px;color:var(--text-secondary)">${p.status}</span>
+    </div>`;
+  }).join('');
+}
+
+async function cancelTask() {
+  const r = await api('/api/task/cancel', {method:'POST'});
+  if (r.ok) { toast('Task cancelled', '#f59e0b'); loadTasks(); }
+}
+
+async function reassignSubtask(taskId, subtaskId) {
+  if (!_allAgents.length) {
+    const r = await api('/api/agents');
+    if (r.ok) { const d = await r.json(); _allAgents = d.agents || []; }
+  }
+  const agentId = prompt(
+    'Reassign subtask to which agent?\nAvailable: ' +
+    _allAgents.map(a=>a.id).join(', ')
+  );
+  if (!agentId) return;
+  const r = await api('/api/task/reassign', {method:'POST', body: JSON.stringify({task_id: taskId, subtask_id: subtaskId, agent_id: agentId.trim()})});
+  if (r.ok) { toast('Subtask reassigned ✅', '#10b981'); loadTasks(); }
+  else toast('Reassign failed', '#ef4444');
+}
+
+// ── Swarm ────────────────────────────────────────────────────────────────────
+async function loadSwarm() {
+  const r = await api('/api/agents');
+  if (!r.ok) return;
+  const d = await r.json();
+  const agents = d.agents || [];
+  _allAgents = agents; // cache for task picker
+  const grid = document.getElementById('swarm-grid');
+  if (!agents.length) {
+    grid.innerHTML = '<div class="empty"><div class="icon">🐝</div><p>No agent data.</p></div>';
+    return;
+  }
+  grid.innerHTML = agents.map(a => {
+    const color = _catColors[a.category] || '#64748b';
+    const dotColor = a.running ? '#10b981' : '#ef4444';
+    const runningDot = `<span style="width:8px;height:8px;border-radius:50%;background:${dotColor};display:inline-block;margin-left:6px"></span>`;
+    const skills = (a.skills||[]).slice(0,4).map(s => `<span style="background:var(--surface);padding:2px 6px;border-radius:3px;font-size:.73em;color:var(--text-secondary)">${escHtml(s)}</span>`).join('');
+    return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;border-top:3px solid ${color}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-weight:600;font-size:.95em">${escHtml(a.id)}</div>
+        ${runningDot}
+      </div>
+      <div style="font-size:.8em;color:var(--text-secondary);margin-bottom:10px;line-height:1.4">${escHtml(a.description||'')}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px">${skills}${(a.skills||[]).length > 4 ? `<span style="font-size:.73em;color:var(--text-muted)">+${(a.skills||[]).length-4} more</span>` : ''}</div>
+      <div style="margin-top:8px;font-size:.75em;color:var(--text-muted)">Category: ${escHtml(a.category||'')}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Commands Tab ─────────────────────────────────────────────────────────────
+const COMMAND_GROUPS = [
+  {
+    cat: '⚙️ System',
+    cmds: [
+      ['status', 'Get current bot status report'],
+      ['workers', 'List all active workers'],
+      ['start <bot>', 'Start a specific bot'],
+      ['stop <bot>', 'Stop a specific bot'],
+      ['schedule', 'List all scheduled tasks'],
+      ['improvements', 'List pending skill proposals'],
+      ['skills', 'Show skills library summary'],
+      ['agents', 'List all AI agents'],
+      ['help', 'Show full command list'],
+      ['cmds', 'Show this commands reference'],
+    ]
+  },
+  {
+    cat: '🏭 Worker Bundles',
+    cmds: [
+      ['worker list', 'List all worker bundles'],
+      ['worker create <name> agents:<a1,a2> task:<desc>', 'Create a worker bundle'],
+      ['worker run <name>', 'Manually trigger a worker'],
+      ['worker enable <name>', 'Enable a worker bundle'],
+      ['worker disable <name>', 'Pause a worker bundle'],
+      ['worker delete <name>', 'Delete a worker bundle'],
+      ['worker status <name>', 'Show worker details & last run'],
+      ['worker ecom', 'Create full e-commerce automation worker preset'],
+    ]
+  },
+  {
+    cat: '🛒 E-commerce Automation',
+    cmds: [
+      ['ecom metrics', 'Real-time revenue / profit / orders dashboard'],
+      ['ecom research <niche>', 'Find top 5 trending product opportunities'],
+      ['ecom listing <product>', 'Generate full Shopify listing (title/desc/tags/price)'],
+      ['ecom email <type> <product>', 'Email flow: welcome|abandoned_cart|post_purchase|upsell'],
+      ['ecom ads <product>', 'Facebook/Google ad copy (headline + body + CTA)'],
+      ['ecom trends', 'Current trending products & niches'],
+      ['ecom service <issue>', 'Customer service reply template'],
+      ['ecom status', 'Listings, emails, and research session count'],
+      ['order process <order_id>', 'Process a specific order'],
+      ['order status <order_id>', 'Get order fulfillment status'],
+      ['inventory check', 'Current stock levels across all products'],
+      ['inventory forecast', '7-day demand forecast & reorder recommendations'],
+      ['inventory reorder', 'Trigger auto-reorder for low-stock items'],
+      ['support ticket <issue>', 'Classify & auto-resolve a support ticket'],
+      ['support refund <order_id>', 'Process a refund automatically'],
+      ['books daily', 'Daily P&L summary from Stripe'],
+      ['books pl', 'Full P&L report (revenue / COGS / ads / profit)'],
+      ['books tax', 'Quarterly tax export'],
+      ['email campaign <segment>', 'Launch email campaign (new/abandoned/repeat)'],
+      ['email abtest <subject1> vs <subject2>', 'Run A/B subject line test'],
+      ['social post <product>', 'Generate & schedule viral social post'],
+      ['social script <topic>', 'TikTok viral script'],
+      ['product scan', 'Daily TikTok/Amazon trending product scan'],
+      ['product validate <idea>', 'Demand validation via Google Trends / JungleScout'],
+      ['product publish <product>', 'Auto-generate listing and publish to Shopify'],
+    ]
+  },
+  {
+    cat: '🚀 Tasks & Orchestration',
+    cmds: [
+      ['task <description>', 'Submit a multi-agent task'],
+      ['task status', 'Show status of active task'],
+      ['task list', 'List recent tasks'],
+      ['task cancel', 'Cancel active task'],
+      ['task agents <a1,a2>', 'Set agents for next task'],
+      ['task mode auto|parallel|single', 'Set execution mode'],
+      ['task config', 'Show current task configuration'],
+      ['assign <agent> <subtask>', 'Manually dispatch a subtask'],
+    ]
+  },
+  {
+    cat: '🏢 Company Building',
+    cmds: [
+      ['company build <idea>', 'Full company launch package'],
+      ['company validate <idea>', 'Viability check & SWOT'],
+      ['company plan <idea>', 'Business plan only'],
+      ['company simulate <scenario>', 'Growth simulation'],
+      ['company gtm <idea>', 'Go-to-market strategy'],
+      ['company pitch <company>', 'Investor pitch deck'],
+      ['company org <company>', 'Org chart design'],
+      ['company swot <topic>', 'SWOT analysis'],
+    ]
+  },
+  {
+    cat: '🪙 Memecoin & Web3',
+    cmds: [
+      ['memecoin create <concept>', 'Full token launch package'],
+      ['memecoin name <concept>', 'Generate token names'],
+      ['memecoin tokenomics <name>', 'Design tokenomics model'],
+      ['memecoin whitepaper <name>', 'Draft whitepaper'],
+      ['memecoin community <name>', 'Community strategy'],
+      ['memecoin viral <name>', 'Viral launch campaign'],
+    ]
+  },
+  {
+    cat: '💰 Finance',
+    cmds: [
+      ['finance model <business>', '3-year financial model'],
+      ['finance pl <business>', 'P&L projections'],
+      ['finance runway <burn> <cash>', 'Burn rate & runway'],
+      ['finance raise <stage> <amount>', 'Fundraising prep'],
+      ['finance unit <product> <price>', 'Unit economics (CAC/LTV)'],
+      ['finance pricing <product>', 'Pricing strategy'],
+      ['finance pitch <company>', 'Investor pitch financials'],
+      ['finance valuation <company>', 'Valuation methodology'],
+    ]
+  },
+  {
+    cat: '👔 HR & People',
+    cmds: [
+      ['hr hire <role>', 'Full hiring package'],
+      ['hr jd <role>', 'Write job description'],
+      ['hr screen <cv-text>', 'AI CV screening & scoring'],
+      ['hr interview <role>', 'Interview question pack'],
+      ['hr onboard <role>', '90-day onboarding plan'],
+      ['hr review <role>', 'Performance review template'],
+      ['hr org <company>', 'Org chart design'],
+      ['hr culture <company>', 'Culture & values document'],
+    ]
+  },
+  {
+    cat: '🎨 Brand',
+    cmds: [
+      ['brand identity <company>', 'Full brand identity system'],
+      ['brand name <industry>', 'Brand name generation (15 options)'],
+      ['brand position <company>', 'Brand positioning strategy'],
+      ['brand voice <company>', 'Brand voice & tone guide'],
+      ['brand messaging <company>', 'Messaging framework'],
+      ['brand story <company>', 'Brand story & narrative'],
+      ['brand audit <company>', 'Competitive brand audit'],
+    ]
+  },
+  {
+    cat: '📈 Growth',
+    cmds: [
+      ['growth loop <product>', 'Viral growth loop design'],
+      ['growth funnel <product>', 'Conversion funnel optimization'],
+      ['growth abtests <feature>', 'A/B test framework'],
+      ['growth retention <product>', 'Retention strategy'],
+      ['growth referral <product>', 'Referral program design'],
+      ['growth plg <product>', 'Product-led growth strategy'],
+      ['growth experiments <product>', 'ICE-scored experiment backlog'],
+    ]
+  },
+  {
+    cat: '📋 Project Management',
+    cmds: [
+      ['pm start <project>', 'Kick off a project'],
+      ['pm breakdown <project>', 'Work breakdown structure'],
+      ['pm sprint <goal>', '2-week sprint plan'],
+      ['pm roadmap <project>', 'Project roadmap & milestones'],
+      ['pm risks <project>', 'Risk register & mitigation'],
+      ['pm raci <project>', 'RACI responsibility matrix'],
+      ['pm gantt <project>', 'Gantt chart (text-based)'],
+      ['pm retro <sprint>', 'Sprint retrospective facilitation'],
+    ]
+  },
+  {
+    cat: '✍️ Content & Social',
+    cmds: [
+      ['content <brief>', 'Full content package'],
+      ['social <brief>', 'Social media content pack'],
+      ['social plan <brief>', 'Strategy plan only'],
+      ['video <topic>', 'Faceless video full pipeline'],
+      ['video script <topic>', 'Video script only'],
+      ['video seo <topic>', 'YouTube SEO pack'],
+      ['newsletter create <topic>', 'Generate newsletter issue'],
+      ['course create <topic>', 'Full course package'],
+      ['course outline <topic>', 'Course structure only'],
+    ]
+  },
+  {
+    cat: '💼 Sales & Leads',
+    cmds: [
+      ['leads <niche> <location>', 'Local business lead generation'],
+      ['outreach <campaign>', 'Outreach campaign'],
+      ['email <brief>', 'Cold email sequence'],
+      ['prospect <niche> <location>', 'Appointment setter prospects'],
+      ['websales audit <url>', 'Website audit + sales pitch'],
+      ['recruit <role> <requirements>', 'Find & screen candidates'],
+    ]
+  },
+  {
+    cat: '📈 Crypto & Trading',
+    cmds: [
+      ['crypto <pair>', 'Technical analysis with signals'],
+      ['trade <pair>', 'Trading signal & risk analysis'],
+      ['signals', 'Current trading signals'],
+      ['signal daily', 'Daily market summary'],
+      ['arb scan <product>', 'Arbitrage opportunity scan'],
+      ['arb opportunities', 'Top arbitrage opportunities'],
+    ]
+  },
+  {
+    cat: '📅 Scheduling',
+    cmds: [
+      ['schedule', 'List all scheduled tasks'],
+      ['schedule add <label> <action> <cron>', 'Add scheduled task (via UI)'],
+    ]
+  },
+];
+
+let _cmdActiveFilter = null;
+let _renderedCmds = [];
+
+function loadCommandsTab() {
+  // Category pills
+  const pills = document.getElementById('cmd-category-pills');
+  pills.innerHTML = `<span onclick="setCmdFilter(null)" id="cmd-pill-all"
+    style="cursor:pointer;padding:4px 10px;border-radius:10px;font-size:.8em;background:var(--primary);color:#fff">All</span>` +
+    COMMAND_GROUPS.map((g,i) => `<span onclick="setCmdFilter(${i})" id="cmd-pill-${i}"
+      style="cursor:pointer;padding:4px 10px;border-radius:10px;font-size:.8em;background:var(--surface2);color:var(--text-secondary)">${g.cat}</span>`
+    ).join('');
+  renderCommands();
+}
+
+function setCmdFilter(idx) {
+  _cmdActiveFilter = idx;
+  document.getElementById('cmd-pill-all').style.background = idx===null ? 'var(--primary)' : 'var(--surface2)';
+  document.getElementById('cmd-pill-all').style.color = idx===null ? '#fff' : 'var(--text-secondary)';
+  COMMAND_GROUPS.forEach((_,i) => {
+    const p = document.getElementById('cmd-pill-' + i);
+    if (!p) return;
+    p.style.background = i===idx ? 'var(--primary)' : 'var(--surface2)';
+    p.style.color = i===idx ? '#fff' : 'var(--text-secondary)';
+  });
+  renderCommands();
+}
+
+function filterCommands() { renderCommands(); }
+
+function renderCommands() {
+  const q = (document.getElementById('cmd-search')?.value || '').toLowerCase();
+  const groups = _cmdActiveFilter !== null ? [COMMAND_GROUPS[_cmdActiveFilter]] : COMMAND_GROUPS;
+  const list = document.getElementById('cmd-list');
+  if (!list) return;
+  list.innerHTML = groups.map(g => {
+    const rows = g.cmds
+      .filter(([cmd, desc]) => !q || cmd.toLowerCase().includes(q) || desc.toLowerCase().includes(q))
+      .map(([cmd, desc]) => `
+        <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border)">
+          <code onclick="copyCmd('${escHtml(cmd)}')" title="Click to copy" style="cursor:pointer;min-width:200px;background:var(--surface2);padding:3px 8px;border-radius:4px;font-size:.84em;color:var(--accent)">${escHtml(cmd)}</code>
+          <span style="color:var(--text-secondary);font-size:.85em;flex:1">${escHtml(desc)}</span>
+          <button class="btn btn-ghost btn-sm" onclick="copyCmd('${escHtml(cmd)}')" style="padding:2px 8px;font-size:.72em">📋</button>
+        </div>`
+      ).join('');
+    if (!rows) return '';
+    return `<div style="margin-bottom:16px">
+      <div style="font-weight:700;font-size:.9em;color:var(--text);margin-bottom:4px">${g.cat}</div>
+      ${rows}
+    </div>`;
+  }).join('');
+}
+
+function copyCmd(cmd) {
+  navigator.clipboard.writeText(cmd).then(() => toast(`Copied: ${cmd}`, '#6366f1')).catch(() => {});
+}
+
+// Initial load
+loadDashboard();
+// Auto-refresh dashboard every 30s
+setInterval(() => { if (currentTab === 'dashboard') loadDashboard(); }, 30000);
+</script>
+</body>
+</html>"""
+
+
+# ─── API endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return INDEX_HTML
+
+
+@app.get("/api/status")
+def get_status():
+    state_file = STATE_DIR / "problem-solver.state.json"
+    if state_file.exists():
+        try:
+            return JSONResponse(json.loads(state_file.read_text()))
+        except Exception:
+            pass
+    return JSONResponse({"ts": None, "bots": [], "note": "No state yet. Start problem-solver."})
+
+
+@app.get("/api/doctor")
+def get_doctor():
+    rc, out = ai_employee("doctor")
+    return JSONResponse({"output": out, "rc": rc})
+
+
+@app.post("/api/bots/start-all")
+def start_all_bots():
+    rc, out = ai_employee("start", "--all")
+    return JSONResponse({"ok": rc == 0, "output": out})
+
+
+@app.post("/api/bots/stop-all")
+def stop_all_bots():
+    rc, out = ai_employee("stop", "--all")
+    return JSONResponse({"ok": rc == 0, "output": out})
+
+
+@app.post("/api/bots/start")
+def start_bot(payload: dict):
+    bot = payload.get("bot", "")
+    if not bot:
+        raise HTTPException(400, "bot name required")
+    rc, out = ai_employee("start", bot)
+    return JSONResponse({"ok": rc == 0, "output": out})
+
+
+@app.post("/api/bots/stop")
+def stop_bot(payload: dict):
+    bot = payload.get("bot", "")
+    if not bot:
+        raise HTTPException(400, "bot name required")
+    rc, out = ai_employee("stop", bot)
+    return JSONResponse({"ok": rc == 0, "output": out})
+
+
+@app.get("/api/workers")
+def get_workers():
+    bots = []
+    if BOTS_DIR.exists():
+        for d in sorted(BOTS_DIR.iterdir()):
+            if d.is_dir():
+                pid_file = AI_HOME / "run" / f"{d.name}.pid"
+                running = False
+                if pid_file.exists():
+                    try:
+                        pid = int(pid_file.read_text().strip())
+                        os.kill(pid, 0)
+                        running = True
+                    except Exception:
+                        pass
+                bots.append({"name": d.name, "running": running})
+    return JSONResponse({"bots": bots})
+
+
+# ─── Chat ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/chat")
+def get_chat():
+    messages = []
+    if CHATLOG.exists():
+        try:
+            for line in CHATLOG.read_text().splitlines():
+                if line.strip():
+                    messages.append(json.loads(line))
+        except Exception:
+            pass
+    return JSONResponse({"messages": messages[-100:]})
+
+
+@app.post("/api/chat")
+def post_chat(payload: dict):
+    message = (payload or {}).get("message", "").strip()
+    if not message:
+        raise HTTPException(400, "message required")
+
+    entry = {"ts": now_iso(), "type": "user", "message": message}
+    CHATLOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHATLOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    # Simple command handling
+    response = handle_command(message)
+    resp_entry = {"ts": now_iso(), "type": "bot", "message": response}
+    with open(CHATLOG, "a") as f:
+        f.write(json.dumps(resp_entry) + "\n")
+
+    return JSONResponse({"ok": True, "response": response})
+
+
+def handle_command(message: str) -> str:
+    msg_lower = message.lower().strip()
+
+    if msg_lower in ("status", "s"):
+        rc, out = ai_employee("status")
+        return f"Bot status:\n{out}" if out.strip() else "No status data."
+
+    if msg_lower in ("workers", "w"):
+        rc, out = ai_employee("status")
+        return f"Workers:\n{out}"
+
+    if msg_lower.startswith("start "):
+        bot = message[6:].strip()
+        rc, out = ai_employee("start", bot)
+        return f"Started {bot}. {out}"
+
+    if msg_lower.startswith("stop "):
+        bot = message[5:].strip()
+        rc, out = ai_employee("stop", bot)
+        return f"Stopped {bot}. {out}"
+
+    # ── Task configuration commands ───────────────────────────────────────────
+    if msg_lower in ("task status", "task list"):
+        plans = _load_task_plans()
+        active = next((p for p in plans if p.get("status") in ("running", "planning")), None)
+        if active:
+            subs = active.get("subtasks", [])
+            done = sum(1 for s in subs if s.get("status") == "done")
+            agents_used = ", ".join({s.get("agent_id","?") for s in subs if s.get("agent_id")})
+            return (
+                f"🚀 Active task: {active.get('title','?')}\n"
+                f"Status: {active.get('status')} | Mode: {active.get('mode','auto')}\n"
+                f"Progress: {done}/{len(subs)} subtasks\n"
+                f"Agents: {agents_used or '—'}"
+            )
+        recent = [p for p in plans[:5] if p.get("status") not in ("running", "planning")]
+        if recent:
+            lines = [f"• {p.get('title','?')[:40]} [{p.get('status')}]" for p in recent]
+            return "No active task. Recent tasks:\n" + "\n".join(lines)
+        return "No tasks found."
+
+    if msg_lower == "task cancel":
+        plans = _load_task_plans()
+        for p in plans:
+            if p.get("status") in ("running", "planning"):
+                p["status"] = "cancelled"
+                p["completed_at"] = now_iso()
+                _save_task_plans(plans)
+                return f"🛑 Cancelled task: {p.get('title','?')}"
+        return "No active task to cancel."
+
+    # task agents <agent1,agent2,...> — set agents for next task submitted via WhatsApp
+    if msg_lower.startswith("task agents "):
+        agents_raw = message[12:].strip()
+        agent_list = [a.strip() for a in agents_raw.replace(";", ",").split(",") if a.strip()]
+        capabilities = _load_agent_capabilities()
+        valid = list(capabilities.get("agents", {}).keys())
+        invalid = [a for a in agent_list if a not in valid]
+        if invalid:
+            return (
+                f"❌ Unknown agents: {', '.join(invalid)}\n"
+                f"Available: {', '.join(valid[:10])}…\n"
+                f"Tip: use exact IDs e.g. company-builder, finance-wizard"
+            )
+        # Store in a temp config file so next 'task <description>' via WhatsApp uses them
+        _task_cfg_file = CONFIG_DIR / "whatsapp_task_config.json"
+        cfg = {}
+        if _task_cfg_file.exists():
+            try:
+                cfg = json.loads(_task_cfg_file.read_text())
+            except Exception:
+                pass
+        cfg["agents"] = agent_list
+        _task_cfg_file.write_text(json.dumps(cfg))
+        return f"✅ Agents set for next task: {', '.join(agent_list)}\nNow send: task <description>"
+
+    # task mode auto|parallel|single
+    if msg_lower.startswith("task mode "):
+        mode = message[10:].strip().lower()
+        if mode not in ("auto", "parallel", "single"):
+            return "❌ Valid modes: auto, parallel, single\nExample: task mode parallel"
+        _task_cfg_file = CONFIG_DIR / "whatsapp_task_config.json"
+        cfg = {}
+        if _task_cfg_file.exists():
+            try:
+                cfg = json.loads(_task_cfg_file.read_text())
+            except Exception:
+                pass
+        cfg["mode"] = mode
+        _task_cfg_file.write_text(json.dumps(cfg))
+        mode_desc = {"auto": "🧠 Orchestrator decides agent assignments", "parallel": "⚡ All selected agents run simultaneously", "single": "1️⃣ Only first/best agent runs"}[mode]
+        return f"✅ Task mode set to: {mode}\n{mode_desc}\nNext task will use this mode."
+
+    # task config — show current WhatsApp task config
+    if msg_lower in ("task config", "task settings"):
+        _task_cfg_file = CONFIG_DIR / "whatsapp_task_config.json"
+        cfg = {}
+        if _task_cfg_file.exists():
+            try:
+                cfg = json.loads(_task_cfg_file.read_text())
+            except Exception:
+                pass
+        agents = cfg.get("agents", [])
+        mode = cfg.get("mode", "auto")
+        return (
+            f"📋 Current task config:\n"
+            f"Mode: {mode}\n"
+            f"Agents: {', '.join(agents) if agents else 'auto-select'}\n"
+            f"\nChange with:\n"
+            f"  task mode <auto|parallel|single>\n"
+            f"  task agents <agent1,agent2>\n"
+            f"  task agents clear"
+        )
+
+    # task agents clear
+    if msg_lower in ("task agents clear", "task agents reset"):
+        _task_cfg_file = CONFIG_DIR / "whatsapp_task_config.json"
+        if _task_cfg_file.exists():
+            try:
+                cfg = json.loads(_task_cfg_file.read_text())
+                cfg.pop("agents", None)
+                _task_cfg_file.write_text(json.dumps(cfg))
+            except Exception:
+                pass
+        return "✅ Agent selection cleared. Next task will use auto-select."
+
+    # ── Worker bundle commands ─────────────────────────────────────────────────
+    # worker list
+    if msg_lower in ("worker list", "workers list", "workers"):
+        bundles = _load_worker_bundles()
+        if not bundles:
+            return "🏭 No worker bundles yet.\nCreate one: worker create <name> agents:<a1,a2> task:<description>"
+        lines = []
+        for b in bundles:
+            enabled_tag = "✅" if b.get("enabled", True) else "⏸"
+            agents_short = ", ".join((b.get("agents") or [])[:3])
+            if len(b.get("agents") or []) > 3:
+                agents_short += f" +{len(b['agents'])-3} more"
+            lines.append(f"{enabled_tag} *{b['name']}* [{b.get('schedule','manual')}]\n   Agents: {agents_short}")
+        return f"🏭 Worker Bundles ({len(bundles)}):\n\n" + "\n\n".join(lines)
+
+    # worker create <name> agents:<a1,a2> task:<description>
+    if msg_lower.startswith("worker create "):
+        rest = message[14:].strip()
+        # Parse agents: param
+        import re as _re
+        agents_match = _re.search(r'agents:\s*([\w,\- ]+?)(?:\s+task:|$)', rest, _re.IGNORECASE)
+        task_match = _re.search(r'task:\s*(.+)', rest, _re.IGNORECASE)
+        worker_name = _re.split(r'\s+agents:', rest, flags=_re.IGNORECASE)[0].strip()
+        if not worker_name:
+            return "❌ Usage: worker create <name> agents:<a1,a2> task:<description>"
+        agents_raw = agents_match.group(1).strip() if agents_match else ""
+        agent_list = [a.strip() for a in agents_raw.replace(";", ",").split(",") if a.strip()] if agents_raw else []
+        task_desc = task_match.group(1).strip() if task_match else ""
+        if not task_desc:
+            return "❌ Usage: worker create <name> agents:<a1,a2> task:<description>"
+        if not agent_list:
+            return "❌ Specify at least one agent: agents:order-processor,support-bot"
+        # Validate agents
+        capabilities = _load_agent_capabilities()
+        valid_agents = set(capabilities.get("agents", {}).keys())
+        invalid = [a for a in agent_list if a not in valid_agents]
+        if invalid:
+            return (f"❌ Unknown agents: {', '.join(invalid)}\n"
+                    f"Available: {', '.join(list(valid_agents)[:10])}…")
+        import uuid as _uuid
+        bundle = {
+            "id": _uuid.uuid4().hex[:10],
+            "name": worker_name,
+            "description": f"Created via WhatsApp",
+            "task_description": task_desc,
+            "schedule": "continuous",
+            "agents": agent_list,
+            "enabled": True,
+            "created_at": now_iso(),
+            "last_run": None,
+        }
+        bundles = _load_worker_bundles()
+        bundles.append(bundle)
+        _save_worker_bundles(bundles)
+        return (f"✅ Worker created: *{worker_name}*\n"
+                f"Agents: {', '.join(agent_list)}\n"
+                f"Task: {task_desc[:80]}\n"
+                f"Use *worker run {worker_name}* to trigger it now.")
+
+    # worker run <name>
+    if msg_lower.startswith("worker run "):
+        w_name = message[11:].strip()
+        bundles = _load_worker_bundles()
+        match = next((b for b in bundles if b["name"].lower() == w_name.lower()), None)
+        if not match:
+            names = [b["name"] for b in bundles]
+            return f"❌ Worker '{w_name}' not found.\nKnown workers: {', '.join(names) or '(none)'}"
+        agents = match.get("agents", [])
+        agents_str = f" [agents:{','.join(agents)}]" if agents else ""
+        msg = f"task {match.get('task_description','')}{agents_str}"
+        entry = {"ts": now_iso(), "type": "user", "message": msg}
+        CHATLOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CHATLOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        match["last_run"] = now_iso()
+        _save_worker_bundles(bundles)
+        return (f"▶ Worker *{match['name']}* triggered!\n"
+                f"Agents: {', '.join(agents)}\n"
+                f"Check *task status* for progress.")
+
+    # worker enable / disable <name>
+    if msg_lower.startswith("worker enable ") or msg_lower.startswith("worker disable "):
+        enable = msg_lower.startswith("worker enable ")
+        w_name = message[14:].strip() if enable else message[15:].strip()
+        bundles = _load_worker_bundles()
+        match = next((b for b in bundles if b["name"].lower() == w_name.lower()), None)
+        if not match:
+            return f"❌ Worker '{w_name}' not found. Use *worker list* to see workers."
+        match["enabled"] = enable
+        _save_worker_bundles(bundles)
+        return f"{'✅ Enabled' if enable else '⏸ Disabled'}: *{match['name']}*"
+
+    # worker delete <name>
+    if msg_lower.startswith("worker delete "):
+        w_name = message[14:].strip()
+        bundles = _load_worker_bundles()
+        remaining = [b for b in bundles if b["name"].lower() != w_name.lower()]
+        if len(remaining) == len(bundles):
+            return f"❌ Worker '{w_name}' not found. Use *worker list* to see workers."
+        _save_worker_bundles(remaining)
+        return f"🗑 Worker '{w_name}' deleted."
+
+    # worker status <name>
+    if msg_lower.startswith("worker status "):
+        w_name = message[14:].strip()
+        bundles = _load_worker_bundles()
+        match = next((b for b in bundles if b["name"].lower() == w_name.lower()), None)
+        if not match:
+            return f"❌ Worker '{w_name}' not found. Use *worker list* to see workers."
+        agents = ", ".join(match.get("agents") or [])
+        last = match.get("last_run") or "Never"
+        enabled = "✅ Enabled" if match.get("enabled", True) else "⏸ Disabled"
+        return (f"🏭 Worker: *{match['name']}*\n"
+                f"Status: {enabled}\n"
+                f"Schedule: {match.get('schedule','manual')}\n"
+                f"Agents: {agents}\n"
+                f"Task: {match.get('task_description','')[:100]}\n"
+                f"Last run: {last}")
+
+    # worker ecom — create the e-commerce preset worker
+    if msg_lower in ("worker ecom", "worker ecom preset", "ecom worker"):
+        ecom_agents = ["order-processor","support-bot","bookkeeper","inventory-sync","email-marketer","social-poster","product-researcher","ecom-dashboard"]
+        capabilities = _load_agent_capabilities()
+        known = set(capabilities.get("agents", {}).keys())
+        available = [a for a in ecom_agents if a in known]
+        import uuid as _uuid
+        bundle = {
+            "id": _uuid.uuid4().hex[:10],
+            "name": "E-commerce Automation Worker",
+            "description": "Full 100% automated e-commerce operation",
+            "task_description": "Run the full e-commerce automation pipeline: process new orders, handle customer support, sync inventory, run email campaigns, post to social media, research new products, and generate daily P&L reports.",
+            "schedule": "continuous",
+            "agents": available,
+            "enabled": True,
+            "created_at": now_iso(),
+            "last_run": None,
+        }
+        bundles = _load_worker_bundles()
+        # Avoid duplicate
+        if not any(b["name"] == bundle["name"] for b in bundles):
+            bundles.append(bundle)
+            _save_worker_bundles(bundles)
+        return (f"🛒 E-commerce Worker created!\n"
+                f"Agents ({len(available)}): {', '.join(available)}\n"
+                f"Use *worker run E-commerce Automation Worker* to start.")
+
+    # cmds / commands — show command categories
+    if msg_lower in ("cmds", "commands", "cmd list"):
+        return (
+            "📜 Command categories — open *📜 Commands* tab in dashboard for full list.\n\n"
+            "⚙️ System: status, workers, start/stop <bot>\n"
+            "🏭 Workers: worker list, worker create, worker run, worker enable/disable, worker delete, worker ecom\n"
+            "🚀 Tasks: task <desc>, task agents <a1,a2>, task mode <m>, task config, task cancel\n"
+            "🏢 Company: company build/validate/plan/simulate/gtm/pitch/org/swot\n"
+            "🪙 Crypto: memecoin create/tokenomics/whitepaper, crypto <pair>, signals\n"
+            "💰 Finance: finance model/pl/runway/raise/unit/pricing/pitch/valuation\n"
+            "👔 HR: hr hire/jd/screen/interview/onboard/review/org/culture\n"
+            "🎨 Brand: brand identity/name/position/voice/messaging/story/audit\n"
+            "📈 Growth: growth loop/funnel/abtests/retention/referral/plg\n"
+            "📋 PM: pm start/breakdown/sprint/roadmap/risks/raci/gantt/retro\n"
+            "✍️ Content: content/social/video/newsletter/course\n"
+            "💼 Sales: leads/outreach/email/recruit/websales\n"
+            "Type *help* for the full command list."
+        )
+
+    if msg_lower == "help":
+        return (
+            "Available commands:\n"
+            "  status / workers — bot status\n"
+            "  start <bot> / stop <bot> — control bots\n"
+            "  schedule / improvements — view tasks & proposals\n"
+            "  skills / agents — skills library & custom agents\n"
+            "  worker list — list all worker bundles\n"
+            "  worker create <name> agents:<a1,a2> task:<desc> — create bundle\n"
+            "  worker run <name> — trigger a worker now\n"
+            "  worker enable/disable/delete/status <name> — manage workers\n"
+            "  worker ecom — create full e-commerce automation worker\n"
+            "  research <query> — web research\n"
+            "  find <topic> / web search <query> / latest news <topic>\n"
+            "  social <brief> — full social media content package\n"
+            "  social plan <brief> — strategy plan only\n"
+            "  content <brief> — same as social\n"
+            "  leads <niche> <location> — local business lead generation\n"
+            "  leads real-estate <location> — real estate leads\n"
+            "  leads status / leads pipeline / leads followup\n"
+            "  recruit <role> <requirements> — find candidates\n"
+            "  recruit screen <cv_text> — AI CV screening\n"
+            "  recruit candidates / recruit status\n"
+            "  ecom research <niche> — trending product research\n"
+            "  ecom listing <product> — generate full product listing\n"
+            "  ecom email <type> <product> — email marketing flow\n"
+            "  ecom trends / ecom ads <product>\n"
+            "  creator plan <topic> — 30-day content calendar\n"
+            "  creator dm-funnel <style> — DM funnel sequence\n"
+            "  creator upsell <tier> — upsell scripts\n"
+            "  creator brand <name> <niche> — full brand kit\n"
+            "  signals — current trading signals (Telegram/Discord)\n"
+            "  signal daily — daily market summary\n"
+            "  signal post <analysis> — post a manual signal\n"
+            "  community update — community newsletter\n"
+            "  prospect <niche> <location> — appointment setter prospects\n"
+            "  outreach <campaign> — generate outreach campaign\n"
+            "  pipeline / setter followup / setter scripts\n"
+            "  newsletter create <topic> — generate newsletter issue\n"
+            "  newsletter subscribe <email> — add subscriber\n"
+            "  newsletter send <issue_id> — send newsletter\n"
+            "  chatbot create <niche> — build niche chatbot\n"
+            "  chatbot flow <niche> — conversation flow\n"
+            "  chatbot scripts <niche> — response scripts\n"
+            "  video <topic> — faceless video full pipeline\n"
+            "  video script <topic> — video script only\n"
+            "  video seo <topic> — YouTube SEO pack\n"
+            "  video tiktok <topic> — TikTok short-form\n"
+            "  pod research <niche> — print-on-demand trends\n"
+            "  pod design <niche> — AI design prompts\n"
+            "  pod listing <product> — full POD listing\n"
+            "  pod ads <product> — ad copy\n"
+            "  course create <topic> — full course package\n"
+            "  course outline <topic> — course structure\n"
+            "  course lesson <module> <title> — lesson content\n"
+            "  course market <topic> — marketing pack\n"
+            "  arb scan <product> — arbitrage scan\n"
+            "  arb trends — hot arbitrage categories\n"
+            "  arb opportunities / arb watchlist\n"
+            "  task <description> — multi-agent orchestration\n"
+            "  task status / task list / task cancel\n"
+            "  agents — list all 20 AI agents\n"
+            "  assign <agent> <subtask> — manual agent dispatch\n"
+            "  company build <idea> — build a company from scratch\n"
+            "  company validate / plan / simulate / gtm / pitch / org / swot\n"
+            "  memecoin create <concept> — full token launch package\n"
+            "  memecoin name / tokenomics / whitepaper / community / viral\n"
+            "  hr hire <role> — full hiring package\n"
+            "  hr jd / screen / interview / onboard / review / org / culture\n"
+            "  finance model <business> — full financial model\n"
+            "  finance pl / runway / raise / unit / pricing / pitch / valuation\n"
+            "  brand identity <company> — full brand system\n"
+            "  brand name / position / voice / messaging / story / audit\n"
+            "  growth loop <product> — viral growth loop\n"
+            "  growth funnel / abtests / retention / referral / plg / experiments\n"
+            "  pm start <project> — kick off a project\n"
+            "  pm breakdown / sprint / roadmap / risks / raci / gantt / retro\n"
+            "  help — this help"
+        )
+
+    if msg_lower in ("schedule", "schedules"):
+        if SCHEDULES_FILE.exists():
+            tasks = json.loads(SCHEDULES_FILE.read_text())
+            if tasks:
+                lines = [f"• {t.get('label',t.get('id'))} ({t.get('action')})" for t in tasks[:10]]
+                return "Scheduled tasks:\n" + "\n".join(lines)
+        return "No scheduled tasks."
+
+    if msg_lower in ("improvements", "i"):
+        if IMPROVEMENTS_FILE.exists():
+            items = json.loads(IMPROVEMENTS_FILE.read_text())
+            pending = [i for i in items if i.get("status") == "pending"]
+            if pending:
+                lines = [f"• {i.get('title', i.get('id'))}" for i in pending[:5]]
+                return f"{len(pending)} pending proposals:\n" + "\n".join(lines) + "\nGo to UI > Improvements to approve."
+        return "No pending improvements."
+
+    # ── Skills commands (pass-through; skills-manager processes these) ──
+    if (msg_lower.startswith("skills") or msg_lower.startswith("agents")
+            or msg_lower.startswith("agent ") or msg_lower.startswith("create agent")
+            or msg_lower.startswith("add skill") or msg_lower.startswith("remove skill")
+            or msg_lower.startswith("delete agent")):
+        if SKILLS_LIBRARY_FILE.exists():
+            try:
+                lib = json.loads(SKILLS_LIBRARY_FILE.read_text())
+                total = len(lib.get("skills", []))
+                cats = len(lib.get("categories", []))
+                return (
+                    f"📚 Skills Library: {total} skills in {cats} categories.\n"
+                    "The skills-manager is processing your command — check the chat in a moment.\n"
+                    "Tip: open the *🛠️ Skills* tab in the dashboard for the full interactive UI."
+                )
+            except (json.JSONDecodeError, OSError):
+                pass
+        return "Skills library not loaded yet. Ensure skills-manager is running."
+
+    # ── Research commands (pass-through; web-researcher processes these) ──
+    if (msg_lower.startswith("research ") or msg_lower.startswith("find ")
+            or msg_lower.startswith("web search ") or msg_lower.startswith("search web ")
+            or msg_lower.startswith("latest news ") or msg_lower.startswith("news about ")
+            or msg_lower.startswith("lookup ")):
+        web_bot_state = STATE_DIR / "web-researcher.state.json"
+        if web_bot_state.exists():
+            try:
+                st = json.loads(web_bot_state.read_text())
+                if st.get("status") == "running":
+                    return (
+                        "🔍 Research request queued — web-researcher bot is processing it.\n"
+                        "The answer will appear in the chat shortly."
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+        return (
+            "🔍 Research request noted — ensure web-researcher bot is running.\n"
+            "Start it: `start web-researcher`"
+        )
+
+    # ── Social media commands (pass-through; social-media-manager processes these) ──
+    if (msg_lower.startswith("social ") or msg_lower.startswith("content ")
+            or msg_lower.startswith("create content ") or msg_lower.startswith("create social ")):
+        social_bot_state = STATE_DIR / "social-media-manager.state.json"
+        if social_bot_state.exists():
+            try:
+                st = json.loads(social_bot_state.read_text())
+                if st.get("status") == "running":
+                    return (
+                        "🎨 Content creation request queued — social-media-manager bot is processing it.\n"
+                        "Full content package will appear in the chat shortly (30-90 seconds)."
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+        return (
+            "🎨 Content request noted — ensure social-media-manager bot is running.\n"
+            "Start it: `start social-media-manager`"
+        )
+
+    # ── Pass-through routing helper ───────────────────────────────────────────
+    def _bot_passthrough(prefixes: list, bot_name: str, emoji: str, desc: str) -> str | None:
+        """Return a pass-through ack if msg matches any prefix, else None."""
+        if not any(msg_lower.startswith(p) for p in prefixes):
+            return None
+        st_file = STATE_DIR / f"{bot_name}.state.json"
+        if st_file.exists():
+            try:
+                st = json.loads(st_file.read_text())
+                if st.get("status") == "running":
+                    return (
+                        f"{emoji} Request queued — {bot_name} bot is processing it.\n"
+                        f"Result will appear in chat shortly."
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+        return f"{emoji} {desc}\nStart it: `start {bot_name}`"
+
+    # Special handler for 'task <description>' — injects stored agent/mode config
+    if msg_lower.startswith("task "):
+        # Load stored WhatsApp task config
+        _task_cfg_file = CONFIG_DIR / "whatsapp_task_config.json"
+        _task_cfg: dict = {}
+        if _task_cfg_file.exists():
+            try:
+                _task_cfg = json.loads(_task_cfg_file.read_text())
+            except Exception:
+                pass
+        _agents_hint = _task_cfg.get("agents", [])
+        _mode_hint = _task_cfg.get("mode", "auto")
+        desc_part = message[5:].strip()
+        # Append hints to the chat message for task-orchestrator to parse
+        agents_str = f" [agents:{','.join(_agents_hint)}]" if _agents_hint else ""
+        mode_str = f" [mode:{_mode_hint}]" if _mode_hint and _mode_hint != "auto" else ""
+        enriched_msg = f"task {desc_part}{agents_str}{mode_str}"
+        entry = {"ts": now_iso(), "type": "user", "message": enriched_msg}
+        CHATLOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CHATLOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        config_note = ""
+        if _agents_hint:
+            config_note = f"\nAgents: {', '.join(_agents_hint)} | Mode: {_mode_hint}"
+        elif _mode_hint and _mode_hint != "auto":
+            config_note = f"\nMode: {_mode_hint}"
+        else:
+            config_note = "\nAgents: auto-selected | Mode: auto"
+        return (
+            f"🚀 Task queued: '{desc_part[:60]}'{config_note}\n"
+            f"Tip: use *task config* to see/change agent settings."
+        )
+
+    for _prefixes, _bot, _emoji, _desc in [
+        (["leads ", "outreach "], "lead-generator", "📋", "Lead generator not running."),
+        (["recruit "], "recruiter", "👔", "Recruiter not running."),
+        (["ecom "], "ecom-agent", "🛒", "Ecom agent not running."),
+        (["creator "], "creator-agency", "🎭", "Creator agency not running."),
+        (["signals", "signal ", "community update"], "signal-community", "📊", "Signal community not running."),
+        (["prospect ", "pipeline", "setter "], "appointment-setter", "📅", "Appointment setter not running."),
+        (["newsletter "], "newsletter-bot", "📧", "Newsletter bot not running."),
+        (["chatbot "], "chatbot-builder", "🤖", "Chatbot builder not running."),
+        (["video "], "faceless-video", "🎬", "Faceless video bot not running."),
+        (["pod "], "print-on-demand", "👕", "Print-on-demand bot not running."),
+        (["course "], "course-creator", "🎓", "Course creator not running."),
+        (["arb "], "arbitrage-bot", "💹", "Arbitrage bot not running."),
+        (["orchestrate "], "task-orchestrator", "🚀", "Task orchestrator not running. Start it: `start task-orchestrator`"),
+        (["company "], "company-builder", "🏢", "Company builder not running. Start it: `start company-builder`"),
+        (["memecoin "], "memecoin-creator", "🪙", "Memecoin creator not running. Start it: `start memecoin-creator`"),
+        (["hr "], "hr-manager", "👔", "HR manager not running. Start it: `start hr-manager`"),
+        (["finance "], "finance-wizard", "💰", "Finance wizard not running. Start it: `start finance-wizard`"),
+        (["brand "], "brand-strategist", "🎨", "Brand strategist not running. Start it: `start brand-strategist`"),
+        (["growth "], "growth-hacker", "🚀", "Growth hacker not running. Start it: `start growth-hacker`"),
+        (["pm "], "project-manager", "📋", "Project manager not running. Start it: `start project-manager`"),
+    ]:
+        _reply = _bot_passthrough(_prefixes, _bot, _emoji, _desc)
+        if _reply is not None:
+            return _reply
+
+    # Default: try AI router (Ollama first, then cloud) before falling back to queued message
+    if _AI_ROUTER_AVAILABLE:
+        try:
+            result = _query_ai(
+                message,
+                system_prompt=(
+                    "You are an AI employee assistant. "
+                    "Help the user with their task or question concisely and practically. "
+                    "If the task requires running a specific bot command, suggest the right command."
+                ),
+            )
+            if result.get("answer"):
+                provider = result.get("provider", "ai")
+                suffix = f"\n_[{provider}]_" if provider not in ("error",) else ""
+                return result["answer"] + suffix
+        except Exception as exc:
+            logger.debug("handle_command: AI router error — %s", exc)
+
+    return (
+        f"Task queued: '{message}'\n"
+        "Tip: use 'start <bot>', 'stop <bot>', 'status', 'help' for commands."
+    )
+
+
+# ─── Schedules ────────────────────────────────────────────────────────────────
+
+@app.get("/api/schedules")
+def get_schedules():
+    if SCHEDULES_FILE.exists():
+        try:
+            return JSONResponse({"tasks": json.loads(SCHEDULES_FILE.read_text())})
+        except Exception:
+            pass
+    return JSONResponse({"tasks": []})
+
+
+@app.post("/api/schedules")
+def add_schedule(task: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tasks = []
+    if SCHEDULES_FILE.exists():
+        try:
+            tasks = json.loads(SCHEDULES_FILE.read_text())
+        except Exception:
+            pass
+
+    task_id = task.get("id", "")
+    if not task_id:
+        raise HTTPException(400, "id required")
+
+    # Replace if exists
+    tasks = [t for t in tasks if t.get("id") != task_id]
+    tasks.append(task)
+    SCHEDULES_FILE.write_text(json.dumps(tasks, indent=2))
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/schedules/{task_id}")
+def delete_schedule(task_id: str):
+    if not SCHEDULES_FILE.exists():
+        return JSONResponse({"ok": True})
+    try:
+        tasks = json.loads(SCHEDULES_FILE.read_text())
+        tasks = [t for t in tasks if t.get("id") != task_id]
+        SCHEDULES_FILE.write_text(json.dumps(tasks, indent=2))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return JSONResponse({"ok": True})
+
+
+# ─── Improvements ─────────────────────────────────────────────────────────────
+
+@app.get("/api/improvements")
+def get_improvements():
+    if IMPROVEMENTS_FILE.exists():
+        try:
+            return JSONResponse({"improvements": json.loads(IMPROVEMENTS_FILE.read_text())})
+        except Exception:
+            pass
+    return JSONResponse({"improvements": []})
+
+
+@app.patch("/api/improvements/{improvement_id}")
+def review_improvement(improvement_id: str, payload: dict):
+    status = payload.get("status", "")
+    if status not in ("approved", "rejected"):
+        raise HTTPException(400, "status must be 'approved' or 'rejected'")
+
+    if not IMPROVEMENTS_FILE.exists():
+        raise HTTPException(404, "no improvements found")
+
+    items = json.loads(IMPROVEMENTS_FILE.read_text())
+    found = False
+    for item in items:
+        if item.get("id") == improvement_id:
+            item["status"] = status
+            item["reviewed_at"] = now_iso()
+            found = True
+            break
+
+    if not found:
+        raise HTTPException(404, f"improvement {improvement_id!r} not found")
+
+    IMPROVEMENTS_FILE.write_text(json.dumps(items, indent=2))
+    return JSONResponse({"ok": True, "id": improvement_id, "status": status})
+
+
+# ─── Skills Library ────────────────────────────────────────────────────────────
+
+@app.get("/api/skills")
+def get_skills(category: str = "", q: str = ""):
+    lib = {}
+    if SKILLS_LIBRARY_FILE.exists():
+        try:
+            lib = json.loads(SKILLS_LIBRARY_FILE.read_text())
+        except Exception:
+            pass
+    skills = lib.get("skills", [])
+    categories = lib.get("categories", sorted({s["category"] for s in skills}))
+    if category:
+        skills = [s for s in skills if s["category"].lower() == category.lower()]
+    if q:
+        ql = q.lower()
+        skills = [
+            s for s in skills
+            if (ql in s["id"].lower() or ql in s["name"].lower()
+                or ql in s["description"].lower()
+                or any(ql in t.lower() for t in s.get("tags", [])))
+        ]
+    return JSONResponse({"skills": skills, "categories": categories, "total": len(skills)})
+
+
+# ─── Custom Agents ─────────────────────────────────────────────────────────────
+
+def _load_library():
+    if SKILLS_LIBRARY_FILE.exists():
+        try:
+            return json.loads(SKILLS_LIBRARY_FILE.read_text())
+        except Exception:
+            pass
+    return {"skills": []}
+
+
+def _load_custom_agents() -> dict:
+    if CUSTOM_AGENTS_FILE.exists():
+        try:
+            return json.loads(CUSTOM_AGENTS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_custom_agents(agents: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CUSTOM_AGENTS_FILE.write_text(json.dumps(agents, indent=2))
+
+
+def _build_system_prompt(name: str, skill_ids: list, library: dict) -> str:
+    skills_map = {s["id"]: s for s in library.get("skills", [])}
+    lines = [f"You are {name}, a specialised AI assistant with the following expertise:", ""]
+    for sid in skill_ids:
+        s = skills_map.get(sid)
+        if s:
+            lines.append(f"- **{s['name']}** ({s['category']}): {s['description']}")
+        else:
+            lines.append(f"- {sid}")
+    lines += ["", "Apply your full expertise when responding. Be precise, actionable, and thorough."]
+    return "\n".join(lines)
+
+
+@app.get("/api/agents/custom")
+def list_custom_agents():
+    agents = _load_custom_agents()
+    result = []
+    for a in agents.values():
+        result.append({
+            "id": a["id"],
+            "name": a["name"],
+            "description": a.get("description", ""),
+            "skills": a.get("skills", []),
+            "skill_count": len(a.get("skills", [])),
+            "created_at": a.get("created_at", ""),
+            "updated_at": a.get("updated_at", ""),
+        })
+    return JSONResponse({"agents": result})
+
+
+@app.post("/api/agents/custom")
+def create_custom_agent(payload: dict):
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name required")
+    skill_ids = [str(s).strip() for s in (payload.get("skills") or []) if str(s).strip()]
+    description = (payload.get("description") or "").strip()
+
+    library = _load_library()
+    known_ids = {s["id"] for s in library.get("skills", [])}
+    valid_ids = [s for s in skill_ids if s in known_ids][:20]
+    unknown = [s for s in skill_ids if s not in known_ids]
+
+    import re as _re
+    agent_id = _re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
+    agents = _load_custom_agents()
+    ts = now_iso()
+    agent = {
+        "id": agent_id,
+        "name": name,
+        "description": description,
+        "skills": valid_ids,
+        "created_at": agents.get(agent_id, {}).get("created_at", ts),
+        "updated_at": ts,
+        "system_prompt": _build_system_prompt(name, valid_ids, library),
+    }
+    agents[agent_id] = agent
+    _save_custom_agents(agents)
+    return JSONResponse({
+        "ok": True,
+        "id": agent_id,
+        "skill_count": len(valid_ids),
+        "unknown_skills": unknown,
+    })
+
+
+@app.delete("/api/agents/custom/{agent_id}")
+def delete_custom_agent(agent_id: str):
+    agents = _load_custom_agents()
+    if agent_id not in agents:
+        raise HTTPException(404, f"agent '{agent_id}' not found")
+    del agents[agent_id]
+    _save_custom_agents(agents)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/agents/custom/{agent_id}")
+def get_custom_agent(agent_id: str):
+    agents = _load_custom_agents()
+    if agent_id not in agents:
+        raise HTTPException(404, f"agent '{agent_id}' not found")
+    return JSONResponse(agents[agent_id])
+
+
+# ─── Task Orchestration API ────────────────────────────────────────────────────
+
+AGENT_CAPS_FILE = CONFIG_DIR / "agent_capabilities.json"
+TASK_PLANS_FILE = CONFIG_DIR / "task_plans.json"
+AGENT_TASKS_DIR = STATE_DIR / "agent_tasks"
+WORKER_BUNDLES_FILE = CONFIG_DIR / "worker_bundles.json"
+
+
+def _load_worker_bundles() -> list:
+    if not WORKER_BUNDLES_FILE.exists():
+        return []
+    try:
+        return json.loads(WORKER_BUNDLES_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_worker_bundles(bundles: list) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    WORKER_BUNDLES_FILE.write_text(json.dumps(bundles, indent=2))
+
+
+# ─── Worker Bundle API ────────────────────────────────────────────────────────
+
+@app.get("/api/workers/bundles")
+def list_worker_bundles():
+    """List all worker bundles."""
+    return JSONResponse({"bundles": _load_worker_bundles()})
+
+
+@app.post("/api/workers/bundles")
+def create_worker_bundle(payload: dict):
+    """Create a new worker bundle."""
+    import uuid as _uuid
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name required")
+    agents = payload.get("agents") or []
+    if not agents:
+        raise HTTPException(400, "at least one agent required")
+    task_description = (payload.get("task_description") or "").strip()
+    if not task_description:
+        raise HTTPException(400, "task_description required")
+    schedule = (payload.get("schedule") or "manual").strip()
+    description = (payload.get("description") or "").strip()
+    enabled = payload.get("enabled", True)
+
+    # Validate agents
+    capabilities = _load_agent_capabilities()
+    known_agents = set(capabilities.get("agents", {}).keys())
+    invalid = [a for a in agents if a not in known_agents]
+    if invalid:
+        raise HTTPException(400, f"Unknown agents: {', '.join(invalid)}")
+
+    bundle = {
+        "id": _uuid.uuid4().hex[:10],
+        "name": name,
+        "description": description,
+        "task_description": task_description,
+        "schedule": schedule,
+        "agents": agents,
+        "enabled": enabled,
+        "created_at": now_iso(),
+        "last_run": None,
+    }
+    bundles = _load_worker_bundles()
+    bundles.append(bundle)
+    _save_worker_bundles(bundles)
+    return JSONResponse({"ok": True, "bundle": bundle})
+
+
+@app.patch("/api/workers/bundles/{bundle_id}")
+def update_worker_bundle(bundle_id: str, payload: dict):
+    """Update an existing worker bundle."""
+    bundles = _load_worker_bundles()
+    for b in bundles:
+        if b["id"] == bundle_id:
+            for field in ("name", "description", "task_description", "schedule", "agents", "enabled"):
+                if field in payload:
+                    b[field] = payload[field]
+            b["updated_at"] = now_iso()
+            _save_worker_bundles(bundles)
+            return JSONResponse({"ok": True, "bundle": b})
+    raise HTTPException(404, f"bundle '{bundle_id}' not found")
+
+
+@app.delete("/api/workers/bundles/{bundle_id}")
+def delete_worker_bundle(bundle_id: str):
+    """Delete a worker bundle."""
+    bundles = _load_worker_bundles()
+    remaining = [b for b in bundles if b["id"] != bundle_id]
+    if len(remaining) == len(bundles):
+        raise HTTPException(404, f"bundle '{bundle_id}' not found")
+    _save_worker_bundles(remaining)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/workers/bundles/{bundle_id}/run")
+def run_worker_bundle(bundle_id: str):
+    """Manually trigger a worker bundle — submits its task to the orchestrator chatlog."""
+    bundles = _load_worker_bundles()
+    for b in bundles:
+        if b["id"] != bundle_id:
+            continue
+        desc = b.get("task_description", "")
+        agents = b.get("agents", [])
+        agents_str = f" [agents:{','.join(agents)}]" if agents else ""
+        msg = f"task {desc}{agents_str}"
+        entry = {"ts": now_iso(), "type": "user", "message": msg}
+        CHATLOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CHATLOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        b["last_run"] = now_iso()
+        _save_worker_bundles(bundles)
+        return JSONResponse({"ok": True, "message": f"Worker '{b['name']}' triggered", "agents": agents})
+    raise HTTPException(404, f"bundle '{bundle_id}' not found")
+
+
+def _load_agent_capabilities() -> dict:
+    if not AGENT_CAPS_FILE.exists():
+        return {}
+    try:
+        return json.loads(AGENT_CAPS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _load_task_plans() -> list:
+    if not TASK_PLANS_FILE.exists():
+        return []
+    try:
+        return json.loads(TASK_PLANS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_task_plans(plans: list) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    TASK_PLANS_FILE.write_text(json.dumps(plans, indent=2))
+
+
+@app.post("/api/task/submit")
+def submit_task(payload: dict):
+    """Submit a task for multi-agent orchestration via chatlog.
+    Accepts optional 'agents' list and 'mode' string.
+    """
+    description = (payload.get("description") or "").strip()
+    if not description:
+        raise HTTPException(400, "description required")
+
+    agents: list = payload.get("agents") or []
+    mode: str = (payload.get("mode") or "auto").strip()
+
+    # Build the chat message so task-orchestrator can pick it up
+    agents_hint = ""
+    if agents:
+        agents_hint = f" [agents:{','.join(agents)}]"
+    mode_hint = f" [mode:{mode}]" if mode and mode != "auto" else ""
+    task_msg = f"task {description}{agents_hint}{mode_hint}"
+
+    entry = {"ts": now_iso(), "type": "user", "message": task_msg}
+    CHATLOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHATLOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    # Create a pending plan entry so the UI can show it immediately
+    import uuid as _uuid
+    task_id = _uuid.uuid4().hex[:12]
+    plan = {
+        "id": task_id,
+        "title": description[:80],
+        "status": "planning",
+        "mode": mode,
+        "agents_hint": agents,
+        "subtasks": [],
+        "created_at": now_iso(),
+    }
+    plans = _load_task_plans()
+    plans.insert(0, plan)
+    _save_task_plans(plans[:50])  # keep last 50
+
+    return JSONResponse({"ok": True, "task_id": task_id, "message": f"Task submitted: {description[:60]}", "agents": agents, "mode": mode})
+
+
+@app.post("/api/task/cancel")
+def cancel_task():
+    """Cancel the currently running task plan."""
+    plans = _load_task_plans()
+    for p in plans:
+        if p.get("status") in ("running", "planning"):
+            p["status"] = "cancelled"
+            p["completed_at"] = now_iso()
+            _save_task_plans(plans)
+            return JSONResponse({"ok": True, "cancelled_id": p["id"]})
+    return JSONResponse({"ok": False, "message": "No active task found"})
+
+
+@app.post("/api/task/reassign")
+def reassign_subtask(payload: dict):
+    """Reassign a pending subtask to a different agent."""
+    task_id = (payload.get("task_id") or "").strip()
+    subtask_id = (payload.get("subtask_id") or "").strip()
+    agent_id = (payload.get("agent_id") or "").strip()
+    if not all([task_id, subtask_id, agent_id]):
+        raise HTTPException(400, "task_id, subtask_id, and agent_id are required")
+
+    # Validate agent exists
+    capabilities = _load_agent_capabilities()
+    if agent_id not in capabilities.get("agents", {}):
+        raise HTTPException(400, f"Unknown agent '{agent_id}'")
+
+    plans = _load_task_plans()
+    for p in plans:
+        if p.get("id") != task_id:
+            continue
+        for st in p.get("subtasks", []):
+            if (st.get("subtask_id") or st.get("id")) == subtask_id:
+                if st.get("status") not in ("pending", "failed"):
+                    raise HTTPException(400, f"Can only reassign pending/failed subtasks (current: {st.get('status')})")
+                old = st.get("agent_id")
+                st["agent_id"] = agent_id
+                st["status"] = "pending"
+                _save_task_plans(plans)
+                return JSONResponse({"ok": True, "subtask_id": subtask_id, "old_agent": old, "new_agent": agent_id})
+        raise HTTPException(404, f"Subtask '{subtask_id}' not found in task '{task_id}'")
+    raise HTTPException(404, f"Task '{task_id}' not found")
+
+
+# Agent keyword→category scoring map used by auto-select.
+# Keys use task-description vocabulary (not agent skill IDs), so this intentionally
+# differs from agent_capabilities.json.  It is derived from each agent's specialties
+# and kept here for fast, dependency-free lookup.  Update when adding new agents.
+_AGENT_KEYWORDS: dict[str, list[str]] = {
+    "company-builder":   ["company", "startup", "build", "launch", "found", "business plan", "enterprise", "venture", "gtm", "go-to-market", "mvp", "market entry", "b2b", "b2c"],
+    "brand-strategist":  ["brand", "logo", "identity", "name", "naming", "visual", "design", "positioning", "voice", "messaging", "tagline", "story", "rebrand"],
+    "finance-wizard":    ["finance", "financial", "revenue", "profit", "pl", "p&l", "model", "valuation", "fundrais", "investor", "pitch", "vc", "budget", "unit economics", "burn", "runway", "cac", "ltv"],
+    "hr-manager":        ["hire", "hiring", "recruit", "hr", "team", "culture", "onboard", "job description", "interview", "employee", "headcount", "org chart", "talent", "people"],
+    "growth-hacker":     ["grow", "growth", "viral", "funnel", "retention", "referral", "plg", "activation", "conversion", "ab test", "churn", "user acquisition", "marketing channel"],
+    "project-manager":   ["project", "sprint", "roadmap", "milestone", "gantt", "risk", "plan", "timeline", "deadline", "deliverable", "backlog", "agile", "scrum", "scope"],
+    "content-master":    ["content", "blog", "article", "seo", "write", "copywrite", "post", "long-form", "keyword", "headline", "editorial"],
+    "social-guru":       ["social", "instagram", "twitter", "tiktok", "linkedin", "facebook", "viral post", "caption", "hashtag", "reel", "story", "thread", "community"],
+    "intel-agent":       ["research", "competitor", "market", "intelligence", "swot", "analyse", "analyze", "landscape", "benchmark", "trend", "industry", "sector"],
+    "lead-hunter":       ["lead", "prospect", "b2b list", "cold outreach", "decision maker", "crm", "pipeline", "contact list"],
+    "email-ninja":       ["email", "cold email", "drip", "sequence", "deliverability", "open rate", "subject line", "newsletter email"],
+    "creative-studio":   ["ad", "creative", "banner", "image prompt", "ad copy", "campaign", "visual", "design brief"],
+    "crypto-trader":     ["crypto", "bitcoin", "ethereum", "trade", "trading", "chart", "technical analysis", "signal", "defi", "altcoin"],
+    "memecoin-creator":  ["memecoin", "token", "tokenomics", "whitepaper", "web3", "nft", "meme coin", "launch token", "smart contract"],
+    "data-analyst":      ["data", "analytics", "dashboard", "kpi", "metric", "report", "insight", "survey", "statistic"],
+    "support-bot":       ["support", "faq", "ticket", "customer service", "helpdesk", "escalat", "sentiment", "complaint", "refund", "customer complaint", "help desk", "return", "exchange"],
+    "product-scout":     ["product", "ecommerce", "shopify", "amazon", "arbitrage", "dropship", "supplier", "niche product", "trend product"],
+    "bot-dev":           ["code", "develop", "python", "script", "api", "bot", "automate", "integration", "endpoint", "webhook"],
+    "web-sales":         ["website", "landing page", "ux", "conversion rate", "seo audit", "pitch website", "sales page"],
+    "orchestrator":      ["coordinate", "orchestrate", "multi-agent", "full pipeline", "end-to-end", "all agents"],
+    # Ecom agents
+    "order-processor":   ["order", "shopify", "webhook", "printful", "fulfill", "dispatch", "tracking", "payment validation", "supplier order"],
+    "bookkeeper":        ["bookkeeping", "accounting", "p&l", "expense", "stripe data", "quickbooks", "tax", "profit report", "daily report"],
+    "inventory-sync":    ["inventory", "stock", "reorder", "supplier sync", "demand forecast", "low stock", "out of stock", "printful sync"],
+    "email-marketer":    ["email campaign", "mailchimp", "welcome email", "abandoned cart", "drip sequence", "newsletter campaign", "segment customers"],
+    "social-poster":     ["tiktok post", "instagram post", "twitter post", "social schedule", "viral script", "auto post", "social media automation"],
+    "product-researcher":["product research", "trending product", "tiktok trend", "amazon trend", "junglescout", "product listing", "auto-list", "shopify product"],
+    "ecom-dashboard":    ["ecom metrics", "revenue report", "profit margin report", "daily digest", "order analytics", "ecommerce kpi", "ecom dashboard"],
+}
+
+
+@app.post("/api/task/auto-agents")
+def auto_select_agents(payload: dict):
+    """Return suggested agent IDs for a given task description using keyword scoring."""
+    description = (payload.get("description") or "").strip().lower()
+    if not description:
+        raise HTTPException(400, "description required")
+
+    scores: dict[str, int] = {}
+    for agent_id, keywords in _AGENT_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in description)
+        if score > 0:
+            scores[agent_id] = score
+
+    # Sort by score descending; take top agents covering the task
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Always include at least 1; cap at 6 unless the description is very broad
+    max_agents = 6 if len(description) > 80 else 4
+    suggested = [aid for aid, _ in ranked[:max_agents]]
+
+    # If nothing matched, fall back to orchestrator
+    if not suggested:
+        suggested = ["orchestrator"]
+
+    # Attach reasons
+    reasons = {aid: [kw for kw in _AGENT_KEYWORDS.get(aid, []) if kw in description][:3] for aid in suggested}
+
+    return JSONResponse({"suggested": suggested, "scores": dict(ranked[:max_agents]), "reasons": reasons})
+
+
+@app.get("/api/task/list")
+def list_tasks():
+    """List all task plans (active and history)."""
+    plans = _load_task_plans()
+    return JSONResponse({"plans": plans[:20]})
+
+
+@app.get("/api/task/status/{task_id}")
+def get_task_status(task_id: str):
+    """Get status of a specific task plan."""
+    plans = _load_task_plans()
+    for p in plans:
+        if p.get("id") == task_id:
+            return JSONResponse(p)
+    raise HTTPException(404, f"task '{task_id}' not found")
+
+
+@app.get("/api/agents")
+def get_all_agents():
+    """Get all 20 agents with capabilities and running status."""
+    capabilities = _load_agent_capabilities()
+    agents_config = capabilities.get("agents", {})
+
+    result = []
+    for agent_id, info in agents_config.items():
+        pid_file = AI_HOME / "run" / f"{agent_id}.pid"
+        running = False
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)
+                running = True
+            except Exception:
+                pass
+
+        # Get current state if available
+        state_file = STATE_DIR / f"{agent_id}.state.json"
+        current_task = None
+        if state_file.exists():
+            try:
+                st = json.loads(state_file.read_text())
+                current_task = st.get("active_plan_title") or st.get("current_task")
+            except Exception:
+                pass
+
+        result.append({
+            "id": agent_id,
+            "description": info.get("description", ""),
+            "category": info.get("category", ""),
+            "skills": info.get("skills", []),
+            "commands": info.get("commands", []),
+            "specialties": info.get("specialties", []),
+            "parallel_capable": info.get("parallel_capable", True),
+            "running": running,
+            "current_task": current_task,
+        })
+
+    return JSONResponse({"agents": result, "total": len(result)})
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=HOST, port=PORT)
