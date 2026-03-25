@@ -1,118 +1,77 @@
 #!/bin/bash
-# Quick start script for OpenClaw AI + AI Employee
+# Start script — AI Employee + OpenClaw 2
 
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AI_EMPLOYEE_DIR="$REPO_DIR/ai-employee"
+OPENCLAW2_DIR="$REPO_DIR/openclaw2"
 
 echo "================================================"
-echo "OpenClaw AI + AI Employee"
-echo "Quick Start"
+echo "AI Employee + OpenClaw 2"
 echo "================================================"
 
-# Check if virtual environment exists
+# ── Virtual environment check ─────────────────────────────────────────────────
 if [ ! -d "$REPO_DIR/venv" ]; then
-    echo "Error: Virtual environment not found."
-    echo "Please run setup.sh first:"
-    echo "  ./setup.sh"
+    echo "Error: virtual environment not found. Run ./setup.sh first."
     exit 1
 fi
 
-# Activate virtual environment
 source "$REPO_DIR/venv/bin/activate"
-
-# Check if JWT secret is set
-if [ -z "$JWT_SECRET_KEY" ]; then
-    # Try loading from .env
-    if [ -f "$REPO_DIR/.env" ]; then
-        set -a
-        source "$REPO_DIR/.env"
-        set +a
-    fi
-fi
-
-if [ -z "$JWT_SECRET_KEY" ]; then
-    echo ""
-    echo "⚠️  WARNING: JWT_SECRET_KEY environment variable not set"
-    echo ""
-    echo "Generating a secure JWT secret for this session..."
-    export JWT_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
-    echo "JWT_SECRET_KEY=$JWT_SECRET_KEY"
-    echo ""
-    echo "💡 To persist this key, add it to your .env file:"
-    echo "   echo 'JWT_SECRET_KEY=$JWT_SECRET_KEY' >> .env"
-    echo ""
-fi
-
-# Export AI_HOME so the AI Employee bots know where to find their files
-export AI_HOME="$AI_EMPLOYEE_DIR"
-
-# ── Start OpenClaw API server (background) ────────────────────────────────────
-echo ""
-echo "Starting OpenClaw AI API server (port 8000)..."
-mkdir -p "$REPO_DIR/logs"
-nohup python3 "$REPO_DIR/main.py" >> "$REPO_DIR/logs/openclaw.log" 2>&1 &
-OPENCLAW_PID=$!
-echo "$OPENCLAW_PID" > "$REPO_DIR/logs/openclaw.pid"
-echo "✓ OpenClaw API server started (pid=$OPENCLAW_PID)"
-echo "  → API: http://127.0.0.1:8000"
-echo "  → Docs: http://127.0.0.1:8000/docs (debug mode only)"
-
-# ── Start AI Employee bots ─────────────────────────────────────────────────────
-echo ""
-echo "Starting AI Employee bots..."
-mkdir -p "$AI_EMPLOYEE_DIR/logs" "$AI_EMPLOYEE_DIR/run" "$AI_EMPLOYEE_DIR/state"
-
-# Set PYTHON to the venv python so bots use the correct environment
-export PYTHON="$REPO_DIR/venv/bin/python3"
-
-# Override python3 for bots by prepending venv bin to PATH
 export PATH="$REPO_DIR/venv/bin:$PATH"
 
-AI_EMPLOYEE_BIN="$AI_EMPLOYEE_DIR/runtime/bin/ai-employee"
+# ── Load OpenClaw 2 .env ─────────────────────────────────────────────────────
+if [ -f "$OPENCLAW2_DIR/.env" ]; then
+    set -a; source "$OPENCLAW2_DIR/.env"; set +a
+fi
+
+# Auto-generate JWT secret for the session if none set
+if [ -z "${JWT_SECRET_KEY:-}" ]; then
+    export JWT_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    echo "⚠️  No JWT_SECRET_KEY set — generated one for this session."
+    echo "   Add to openclaw2/.env:  JWT_SECRET_KEY=$JWT_SECRET_KEY"
+    echo ""
+fi
+
+# ── Start OpenClaw 2 API server ───────────────────────────────────────────────
+echo "Starting OpenClaw 2 API server (http://127.0.0.1:8000)..."
+mkdir -p "$OPENCLAW2_DIR/logs"
+cd "$OPENCLAW2_DIR"
+nohup python3 main.py >> "$OPENCLAW2_DIR/logs/openclaw.log" 2>&1 &
+OPENCLAW_PID=$!
+echo "$OPENCLAW_PID" > "$REPO_DIR/run/openclaw.pid"
+echo "✓ OpenClaw 2 started (pid=$OPENCLAW_PID)"
+cd "$REPO_DIR"
+
+# ── Start AI Employee bots ────────────────────────────────────────────────────
+export AI_HOME="$REPO_DIR"
+mkdir -p "$REPO_DIR/run" "$REPO_DIR/state"
+
+AI_EMPLOYEE_BIN="$REPO_DIR/runtime/bin/ai-employee"
 if [ -x "$AI_EMPLOYEE_BIN" ]; then
-    "$AI_EMPLOYEE_BIN" start --all >> "$AI_EMPLOYEE_DIR/logs/startup.log" 2>&1 || true
-    echo "✓ AI Employee bots started"
-    echo "  → Problem Solver UI: http://127.0.0.1:8787"
+    echo "Starting AI Employee bots..."
+    "$AI_EMPLOYEE_BIN" start --all >> "$REPO_DIR/logs/startup.log" 2>&1 || true
+    echo "✓ AI Employee bots started (Problem Solver UI: http://127.0.0.1:8787)"
 else
-    echo "⚠️  AI Employee bin not found at $AI_EMPLOYEE_BIN"
+    echo "⚠️  AI Employee bin not found — skipping bots"
 fi
 
 echo ""
 echo "================================================"
-echo "All services started!"
+echo "All services running"
 echo "================================================"
-echo ""
-echo "  OpenClaw API:      http://127.0.0.1:8000"
+echo "  OpenClaw 2 API:    http://127.0.0.1:8000"
 echo "  Problem Solver UI: http://127.0.0.1:8787"
-echo "  Health check:      http://127.0.0.1:8000/health"
-echo ""
-echo "Logs:"
-echo "  OpenClaw: $REPO_DIR/logs/openclaw.log"
-echo "  Bots:     $AI_EMPLOYEE_DIR/logs/"
+echo "  Logs: openclaw2/logs/  |  logs/"
 echo ""
 echo "Press Ctrl+C to stop all services."
 echo ""
 
-# Cleanup function
 cleanup() {
-    echo ""
     echo "Stopping all services..."
-    # Stop AI Employee bots
-    if [ -x "$AI_EMPLOYEE_BIN" ]; then
-        "$AI_EMPLOYEE_BIN" stop --all >/dev/null 2>&1 || true
-    fi
-    # Stop OpenClaw API
-    if [ -f "$REPO_DIR/logs/openclaw.pid" ]; then
-        kill "$(cat "$REPO_DIR/logs/openclaw.pid")" 2>/dev/null || true
-        rm -f "$REPO_DIR/logs/openclaw.pid"
-    fi
-    echo "✓ All services stopped."
+    [ -x "$AI_EMPLOYEE_BIN" ] && "$AI_EMPLOYEE_BIN" stop --all >/dev/null 2>&1 || true
+    [ -f "$REPO_DIR/run/openclaw.pid" ] && kill "$(cat "$REPO_DIR/run/openclaw.pid")" 2>/dev/null || true
+    rm -f "$REPO_DIR/run/openclaw.pid"
+    echo "✓ Stopped."
 }
-
 trap cleanup EXIT INT TERM
-
-# Wait indefinitely (keep services running)
 wait $OPENCLAW_PID 2>/dev/null || true
-

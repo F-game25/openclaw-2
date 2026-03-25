@@ -55,7 +55,11 @@ logs/
 api_keys.txt
 
 # AI Employee runtime state (generated at runtime)
-ai-employee/logs/
-ai-employee/run/
-ai-employee/state/
-ai-employee/workspace/
+run/
+state/
+workspace/
+
+# OpenClaw 2
+openclaw2/data/
+openclaw2/logs/
+openclaw2/config.local.yml

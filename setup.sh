@@ -1,13 +1,13 @@
 #!/bin/bash
-# Setup script for OpenClaw AI + AI Employee (merged)
+# Setup script for AI Employee + OpenClaw 2
 
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AI_EMPLOYEE_DIR="$REPO_DIR/ai-employee"
+OPENCLAW2_DIR="$REPO_DIR/openclaw2"
 
 echo "================================================"
-echo "OpenClaw AI + AI Employee"
+echo "AI Employee + OpenClaw 2"
 echo "Setup Script"
 echo "================================================"
 echo ""
@@ -16,7 +16,6 @@ echo ""
 python_version=$(python3 --version 2>&1 | awk '{print $2}')
 echo "✓ Found Python $python_version"
 
-# Check if Python 3.8+
 required_version="3.8"
 if [ "$(printf '%s\n' "$required_version" "$python_version" | sort -V | head -n1)" != "$required_version" ]; then
     echo "✗ Error: Python 3.8 or higher required"
@@ -29,84 +28,55 @@ echo "Creating virtual environment..."
 python3 -m venv "$REPO_DIR/venv"
 echo "✓ Virtual environment created"
 
-# Activate virtual environment
-echo ""
-echo "Activating virtual environment..."
 source "$REPO_DIR/venv/bin/activate"
-echo "✓ Virtual environment activated"
+pip install --upgrade pip -q
 
-# Upgrade pip
+# Install OpenClaw 2 dependencies
 echo ""
-echo "Upgrading pip..."
-pip install --upgrade pip > /dev/null
-echo "✓ pip upgraded"
+echo "Installing OpenClaw 2 dependencies..."
+pip install -r "$OPENCLAW2_DIR/requirements.txt" -q
+echo "✓ OpenClaw 2 dependencies installed"
 
-# Install all dependencies (OpenClaw + AI Employee)
+# Create runtime directories
 echo ""
-echo "Installing dependencies..."
-pip install -r "$REPO_DIR/requirements.txt"
-echo "✓ Dependencies installed"
-
-# Create necessary directories
-echo ""
-echo "Creating directories..."
-mkdir -p "$REPO_DIR/data" "$REPO_DIR/logs"
-mkdir -p "$AI_EMPLOYEE_DIR/logs" "$AI_EMPLOYEE_DIR/run" "$AI_EMPLOYEE_DIR/state" "$AI_EMPLOYEE_DIR/workspace"
+echo "Creating runtime directories..."
+mkdir -p "$REPO_DIR/run" "$REPO_DIR/state" "$REPO_DIR/workspace"
+mkdir -p "$OPENCLAW2_DIR/data" "$OPENCLAW2_DIR/logs"
 echo "✓ Directories created"
 
-# Setup configuration
+# Setup OpenClaw 2 config
 echo ""
-if [ ! -f "$REPO_DIR/config.local.yml" ]; then
-    echo "Creating local configuration..."
-    cp "$REPO_DIR/config.yml" "$REPO_DIR/config.local.yml"
-    echo "✓ config.local.yml created"
-    echo ""
-    echo "⚠️  IMPORTANT: Edit config.local.yml and change the JWT secret key!"
+if [ ! -f "$OPENCLAW2_DIR/config.local.yml" ]; then
+    cp "$OPENCLAW2_DIR/config.yml" "$OPENCLAW2_DIR/config.local.yml"
+    echo "✓ openclaw2/config.local.yml created — edit it to set your JWT secret"
 else
-    echo "⚠️  config.local.yml already exists, skipping..."
+    echo "⚠️  openclaw2/config.local.yml already exists, skipping"
 fi
 
-# Setup environment file
+# Setup .env
 echo ""
-if [ ! -f "$REPO_DIR/.env" ]; then
-    echo "Creating .env file..."
-    cp "$REPO_DIR/.env.example" "$REPO_DIR/.env"
-    echo "✓ .env created"
-    echo ""
-    echo "⚠️  IMPORTANT: Edit .env and add your JWT secret key!"
+if [ ! -f "$OPENCLAW2_DIR/.env" ]; then
+    cp "$OPENCLAW2_DIR/.env.example" "$OPENCLAW2_DIR/.env"
+    echo "✓ openclaw2/.env created"
 else
-    echo "⚠️  .env already exists, skipping..."
+    echo "⚠️  openclaw2/.env already exists, skipping"
 fi
 
-# Generate secure JWT secret
-echo ""
-echo "Generating secure JWT secret..."
+# Generate JWT secret
 jwt_secret=$(python3 -c "import secrets; print(secrets.token_hex(32))")
 echo ""
 echo "=============================================="
-echo "Your generated JWT secret (save this):"
-echo "$jwt_secret"
-echo "=============================================="
-echo ""
-echo "Add this to .env file as:"
+echo "Generated JWT secret (add to openclaw2/.env):"
 echo "JWT_SECRET_KEY=$jwt_secret"
-echo ""
+echo "=============================================="
 
-# Set secure permissions
-echo "Setting secure file permissions..."
-chmod 700 "$REPO_DIR/data" "$REPO_DIR/logs"
-chmod 600 "$REPO_DIR/.env" 2>/dev/null || true
-chmod 600 "$REPO_DIR/config.local.yml" 2>/dev/null || true
+# Set executable permissions on AI Employee scripts
+echo ""
+echo "Setting script permissions..."
+chmod +x "$REPO_DIR/runtime/bin/ai-employee" 2>/dev/null || true
+chmod +x "$REPO_DIR/runtime/start.sh" "$REPO_DIR/runtime/stop.sh" 2>/dev/null || true
+find "$REPO_DIR/runtime/bots" -name "run.sh" -exec chmod +x {} \; 2>/dev/null || true
 echo "✓ Permissions set"
-
-# Set AI Employee shell scripts executable
-echo ""
-echo "Setting AI Employee script permissions..."
-chmod +x "$AI_EMPLOYEE_DIR/runtime/bin/ai-employee" 2>/dev/null || true
-chmod +x "$AI_EMPLOYEE_DIR/runtime/start.sh" 2>/dev/null || true
-chmod +x "$AI_EMPLOYEE_DIR/runtime/stop.sh" 2>/dev/null || true
-find "$AI_EMPLOYEE_DIR/runtime/bots" -name "run.sh" -exec chmod +x {} \; 2>/dev/null || true
-echo "✓ AI Employee scripts are executable"
 
 echo ""
 echo "================================================"
@@ -114,10 +84,7 @@ echo "Setup complete!"
 echo "================================================"
 echo ""
 echo "Next steps:"
-echo "1. Edit .env and add the JWT secret above"
-echo "   Also add: ANTHROPIC_API_KEY (optional, for Claude agent)"
-echo "2. Review config.local.yml and adjust settings"
+echo "1. Add the JWT secret above to openclaw2/.env"
+echo "2. (Optional) Add ANTHROPIC_API_KEY / OLLAMA settings to openclaw2/.env"
 echo "3. Run: ./start.sh"
-echo ""
-echo "For security best practices, see SECURITY.md"
 echo ""
