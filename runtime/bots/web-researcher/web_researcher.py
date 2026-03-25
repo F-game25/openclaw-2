@@ -127,14 +127,18 @@ def do_research(query: str, context: str = "", include_news: bool = False) -> di
             "error": "ai_router import failed",
         }
 
-    is_news_query = any(kw in query.lower() for kw in
-                        ("news", "latest", "recent", "today", "2025", "2026", "breaking"))
-    sys_prompt = (
-        "You are a precise research assistant. Provide factual, well-sourced answers. "
-        "If asked about recent events, prioritize the most current information available. "
-        f"{context}" if context else
-        "You are a precise research assistant. Provide factual, well-sourced answers."
+    is_news_query = any(
+        kw in query.lower()
+        for kw in ("news", "latest", "recent", "today", "breaking")
     )
+    base_prompt = (
+        "You are a precise research assistant. Provide factual, well-sourced answers. "
+        "If asked about recent events, prioritize the most current information available."
+    )
+    if context:
+        sys_prompt = f"{base_prompt}\n\nAdditional context:\n{context}"
+    else:
+        sys_prompt = base_prompt
 
     try:
         result = _research_fn(
