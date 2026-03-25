@@ -331,12 +331,12 @@ def main() -> None:
     while True:
         # Process chat commands
         new_idx = process_chatlog(last_idx)
-        searches_this_cycle = new_idx - last_idx
+        # Advance the chatlog cursor; searches are not inferred from log length
         last_idx = new_idx
 
         # Process cross-bot requests
         bot_searches = process_requests()
-        total_searches += searches_this_cycle + bot_searches
+        total_searches += bot_searches
 
         write_state({
             "bot": "web-researcher",
