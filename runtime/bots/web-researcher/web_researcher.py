@@ -75,14 +75,66 @@ def write_state(state: dict) -> None:
 
 # ── Chat log helpers ──────────────────────────────────────────────────────────
 
+# Cache for chatlog entries and last processed byte offset to avoid
+# re-reading and re-parsing the entire file on every poll.
+_CHATLOG_CACHE = []
+_CHATLOG_OFFSET = 0
+
+
 def load_chatlog() -> list:
+    """Load and parse the chat log efficiently.
+
+    This function maintains an in-memory cache and a byte offset to only
+    read newly appended lines on subsequent calls, while still returning
+    the full list of entries each time.
+    """
+    global _CHATLOG_CACHE, _CHATLOG_OFFSET
+
     if not CHATLOG.exists():
+        _CHATLOG_CACHE = []
+        _CHATLOG_OFFSET = 0
         return []
+
     try:
-        lines = [l for l in CHATLOG.read_text().splitlines() if l.strip()]
-        return [json.loads(l) for l in lines]
+        stat = CHATLOG.stat()
+        current_size = stat.st_size
+
+        # If the file shrank (rotation/truncation), reset cache and start over.
+        if current_size < _CHATLOG_OFFSET:
+            _CHATLOG_CACHE = []
+            _CHATLOG_OFFSET = 0
+
+        # Read and parse only newly appended lines.
+        if current_size > _CHATLOG_OFFSET:
+            with open(CHATLOG, "r") as f:
+                f.seek(_CHATLOG_OFFSET)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        _CHATLOG_CACHE.append(json.loads(line))
+                    except Exception:
+                        # Skip malformed lines without breaking the whole load.
+                        continue
+                _CHATLOG_OFFSET = f.tell()
+
+        # Return a shallow copy to avoid accidental external mutation.
+        return list(_CHATLOG_CACHE)
     except Exception:
-        return []
+        # Fallback: attempt a full read/parse once; on failure, return [].
+        try:
+            lines = [l for l in CHATLOG.read_text().splitlines() if l.strip()]
+            _CHATLOG_CACHE = [json.loads(l) for l in lines]
+            try:
+                _CHATLOG_OFFSET = CHATLOG.stat().st_size
+            except Exception:
+                _CHATLOG_OFFSET = 0
+            return list(_CHATLOG_CACHE)
+        except Exception:
+            _CHATLOG_CACHE = []
+            _CHATLOG_OFFSET = 0
+            return []
 
 
 def append_chatlog(entry: dict) -> None:
